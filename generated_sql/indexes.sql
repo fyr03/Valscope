@@ -514,4 +514,54 @@ CREATE  INDEX idx_t3_c5 ON t3 (c5);
 
 CREATE  INDEX idx_t3_c9_c10 ON t3 (c9, c10(50));
 
-CREATE  INDEX idx_t3_c9_c12_c15 ON t3 (c9, c12(50), c15);
+CREATE  INDEX idx_t3_c9_c12_c15 ON t3 (c9, c12(50), c15);USE test;
+CREATE UNIQUE INDEX idx_t1_pk ON t1 (c1);
+
+CREATE  INDEX idx_t1_c6 ON t1 (c6);
+
+CREATE  INDEX idx_t1_c6_c3 ON t1 (c6, c3(63));
+
+CREATE  INDEX idx_t1_c2_c3 ON t1 (c2(63), c3(63));
+
+CREATE UNIQUE INDEX idx_t2_pk ON t2 (c1);
+
+CREATE  INDEX idx_t2_c4 ON t2 (c4);
+
+CREATE  INDEX idx_t2_c11_c10_c14 ON t2 (c11, c10, c14);
+
+CREATE  INDEX idx_t2_c6_c14_c13 ON t2 (c6(50), c14, c13);
+
+CREATE UNIQUE INDEX idx_t2_pk_c5_c11 ON t2 (c1, c5, c11);
+
+CREATE UNIQUE INDEX idx_t3_pk ON t3 (c1);
+
+CREATE  INDEX idx_t3_c14 ON t3 (c14);
+
+CREATE  INDEX idx_t3_c8_c11_c12 ON t3 (c8, c11, c12(50));
+
+CREATE UNIQUE INDEX idx_t3_pk_c12_c9 ON t3 (c1, c12(50), c9);USE test;
+CREATE UNIQUE INDEX idx_t1_pk ON t1 (c1);
+
+CREATE  INDEX idx_t1_c3 ON t1 (c3(63));
+
+CREATE  INDEX idx_t1_c3_c4_c5 ON t1 (c3(63), c4, c5);
+
+CREATE UNIQUE INDEX idx_t1_pk_c5_c2 ON t1 (c1, c5, c2(63));
+
+CREATE UNIQUE INDEX idx_t2_pk ON t2 (c1);
+
+CREATE  INDEX idx_t2_c11 ON t2 (c11);
+
+CREATE  INDEX idx_t2_c12_c13_c15 ON t2 (c12, c13, c15);
+
+CREATE  INDEX idx_t2_c2_c3_c10 ON t2 (c2, c3, c10);
+
+CREATE UNIQUE INDEX idx_t2_pk_c10 ON t2 (c1, c10);
+
+CREATE UNIQUE INDEX idx_t3_pk ON t3 (c1);
+
+CREATE  INDEX idx_t3_c14 ON t3 (c14);
+
+CREATE  INDEX idx_t3_c9_c8_c6 ON t3 (c9, c8, c6);
+
+CREATE UNIQUE INDEX idx_t3_pk_c3 ON t3 (c1, c3);

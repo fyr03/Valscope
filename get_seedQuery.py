@@ -65,18 +65,18 @@ class SeedQueryGenerator:
                 if dialect_name == "MYSQL":
                     self.db_config.update({
                         'host': '127.0.0.1',
-                        'user': 'root',
-                        'password': '123456',
+                        'user': 'sqlancer',
+                        'password': 'sqlancer',
                         'database': 'test',
-                        'port': 13306
+                        'port': 3307
                     })
                 elif dialect_name == "MARIADB":
                     self.db_config.update({
                         'host': '127.0.0.1',
-                        'user': 'root',
-                        'password': '123456',
+                        'user': 'sqlancer',
+                        'password': 'sqlancer',
                         'database': 'test',
-                        'port': 9901
+                        'port': 3308
                     })
                 elif dialect_name == "TIDB":
                     self.db_config.update({
