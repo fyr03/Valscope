@@ -300,7 +300,7 @@ class SubsetOracle:
             elif 'BLOB' in dt or 'BINARY' in dt or 'BIT' in dt \
                     or 'JSON' in dt or 'GEOMETRY' in dt or 'POINT' in dt \
                     or 'POLYGON' in dt or 'LINESTRING' in dt:
-                base_dt = 'DATE'   # 复用 DATE 类型：只生成 IS NULL / IS NOT NULL 谓词
+                base_dt = 'OPAQUE'  # 独立类型：禁止参与 JOIN / 列间比较，只生成 IS NULL / IS NOT NULL
                 vlen = 128
             else:
                 base_dt, vlen = 'INT', 128

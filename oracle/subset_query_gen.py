@@ -26,7 +26,7 @@ _STR_SCALAR_FUNS: List[str] = [
 
 _ARITH_OPS: List[str] = ['+', '-', '*']
 
-_NO_JOIN_TYPES: frozenset = frozenset({'FLOAT', 'DOUBLE', 'DECIMAL'})
+_NO_JOIN_TYPES: frozenset = frozenset({'FLOAT', 'DOUBLE', 'DECIMAL', 'DATE', 'OPAQUE'})
 _INT_FAMILY: frozenset = frozenset({'INT', 'BIGINT', 'SMALLINT', 'TINYINT'})
 _NUMERIC_FAMILY: frozenset = frozenset({'INT', 'BIGINT', 'SMALLINT', 'TINYINT',
                                         'FLOAT', 'DOUBLE', 'DECIMAL'})
@@ -499,6 +499,9 @@ class SubsetQueryGenerator:
             if r < 0.35:
                 return f"COALESCE({base}, '2023-01-01')"
             return base
+        
+        if dt == 'OPAQUE':
+            return base
 
         return base
 
@@ -581,6 +584,9 @@ class SubsetQueryGenerator:
             if other and r < 0.35:
                 return f"{ref} >= `{other[0]}`.`{other[1].name}`"
             return f"{ref} IS NOT NULL" if r < 0.65 else f"{ref} IS NULL"
+        
+        if dt == 'OPAQUE':
+            return f"{ref} IS NOT NULL" if r < 0.5 else f"{ref} IS NULL"
 
         hot = self._hot(col)
 
@@ -746,6 +752,8 @@ class SubsetQueryGenerator:
         return [(a, c) for a, cols in alias_cols for c in cols]
 
     def _pairwise_type_compatible(self, c1: Any, c2: Any) -> bool:
+        if c1.data_type == 'OPAQUE' or c2.data_type == 'OPAQUE':
+            return False  # OPAQUE 列禁止参与任何列间比较谓词
         if c1.data_type == c2.data_type:
             return True
         return c1.data_type in _NUMERIC_FAMILY and c2.data_type in _NUMERIC_FAMILY
