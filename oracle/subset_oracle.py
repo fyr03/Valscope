@@ -148,7 +148,7 @@ class SubsetOracle:
 
             # ── Step 1.5：谓词列、索引、偏斜配置 ─────────────
             pred_col = self._choose_predicate_col(main_cols)
-            self._ensure_indexes(conn, main_name, pred_col, uid)
+            self._ensure_indexes(conn, main_name, main_cols, pred_col, uid)
             skew = self._create_skew_profile(main_cols, pred_col)
             self._log(f"  Main table: {main_name}, predicate col: {pred_col.name}, "
                       f"primary_hot={skew.primary_hot}")
@@ -425,9 +425,57 @@ class SubsetOracle:
         non_pk = [c for c in cols if not c.is_primary_key]
         return random.choice(non_pk) if non_pk else cols[0]
 
-    def _ensure_indexes(self, conn, table_name: str, pred_col: ColDef, uid: str):
-        self._exec_ddl(conn, f"CREATE INDEX i_s3_{uid} ON {table_name} (`{pred_col.name}`)",
+    def _ensure_indexes(self, conn, table_name: str, cols: List[ColDef],
+                        pred_col: ColDef, uid: str):
+        pred_idx_col = self._index_expr(pred_col)
+        self._exec_ddl(conn, f"CREATE INDEX i_s3_{uid} ON {table_name} ({pred_idx_col})",
                        ignore_error=True)
+
+        candidates = [
+            c for c in cols
+            if c.name != pred_col.name
+            and not c.is_primary_key
+            and c.data_type in ('INT', 'VARCHAR', 'DATE')
+        ]
+
+        if candidates:
+            extra_cols = random.sample(candidates, k=min(random.randint(1, 2), len(candidates)))
+            for c in extra_cols:
+                self._exec_ddl(
+                    conn,
+                    f"CREATE INDEX i_s3_{uid}_{c.name} ON {table_name} ({self._index_expr(c)})",
+                    ignore_error=True,
+                )
+
+        comp_candidates = [
+            c for c in cols
+            if not c.is_primary_key and c.data_type in ('INT', 'VARCHAR', 'DATE')
+        ]
+        pred_eligible = pred_col.data_type in ('INT', 'VARCHAR', 'DATE') and not pred_col.is_primary_key
+        if pred_eligible and len(comp_candidates) >= 2 and random.random() < 0.8:
+            others = [c for c in comp_candidates if c.name != pred_col.name]
+            if others:
+                c2 = random.choice(others)
+                self._exec_ddl(
+                    conn,
+                    f"CREATE INDEX i_s3_{uid}_comp ON {table_name} "
+                    f"({self._index_expr(pred_col)}, {self._index_expr(c2)})",
+                    ignore_error=True,
+                )
+        elif len(comp_candidates) >= 2 and random.random() < 0.4:
+            c1, c2 = random.sample(comp_candidates, k=2)
+            self._exec_ddl(
+                conn,
+                f"CREATE INDEX i_s3_{uid}_comp ON {table_name} "
+                f"({self._index_expr(c1)}, {self._index_expr(c2)})",
+                ignore_error=True,
+            )
+
+    def _index_expr(self, col: ColDef) -> str:
+        if col.data_type == 'VARCHAR':
+            prefix_len = min(max(1, col.varchar_len), 64)
+            return f"`{col.name}`({prefix_len})"
+        return f"`{col.name}`"
 
     def _create_skew_profile(self, cols: List[ColDef], pred_col: ColDef) -> SkewProfile:
         hot_by_col: Dict[str, List[str]] = {c.name: self._create_hot_values(c) for c in cols}

@@ -35,6 +35,7 @@ _SELECT_MIN_COLS = 1
 _SELECT_MAX_COLS = 5
 _WHERE_MAX_PREDS = 3
 _MAX_GENERATE_RETRIES = 16
+_ORDER_BY_PROB = 0.30
 
 
 class SubsetQueryGenerator:
@@ -56,6 +57,7 @@ class SubsetQueryGenerator:
             'INNER_JOIN_3': self._build_inner_join_3,
             'SELF_JOIN': self._build_self_join,
             'CROSS_JOIN_FILTERED': self._build_cross_join_filtered,
+            'CTE_WRAPPER': self._build_cte_wrapper,
             'DERIVED_TABLE': self._build_derived_table,
             'IN_SUBQUERY': self._build_in_subquery,
             'EXISTS_SUBQUERY': self._build_exists_subquery,
@@ -82,11 +84,12 @@ class SubsetQueryGenerator:
             pool = [
                 ('SINGLE', 34),
                 ('SELF_JOIN', 18),
+                ('CTE_WRAPPER', 10),
                 ('DERIVED_TABLE', 22),
                 ('IN_SUBQUERY', 10),
                 ('EXISTS_SUBQUERY', 6),
-                ('NESTED_DERIVED', 6),
-                ('UNION_ALL', 4),
+                ('NESTED_DERIVED', 4),
+                ('UNION_ALL', 2),
             ]
         elif n == 2:
             pool = [
@@ -94,11 +97,12 @@ class SubsetQueryGenerator:
                 ('INNER_JOIN_2', 24),
                 ('SELF_JOIN', 10),
                 ('CROSS_JOIN_FILTERED', 10),
+                ('CTE_WRAPPER', 8),
                 ('DERIVED_TABLE', 14),
                 ('IN_SUBQUERY', 14),
                 ('EXISTS_SUBQUERY', 10),
-                ('NESTED_DERIVED', 6),
-                ('UNION_ALL', 4),
+                ('NESTED_DERIVED', 4),
+                ('UNION_ALL', 2),
             ]
         else:
             pool = [
@@ -107,11 +111,12 @@ class SubsetQueryGenerator:
                 ('INNER_JOIN_3', 14),
                 ('SELF_JOIN', 10),
                 ('CROSS_JOIN_FILTERED', 8),
+                ('CTE_WRAPPER', 8),
                 ('DERIVED_TABLE', 14),
                 ('IN_SUBQUERY', 12),
                 ('EXISTS_SUBQUERY', 8),
                 ('NESTED_DERIVED', 4),
-                ('UNION_ALL', 4),
+                ('UNION_ALL', 2),
             ]
         shapes, weights = zip(*pool)
         return random.choices(shapes, weights=weights, k=1)[0]
@@ -121,10 +126,11 @@ class SubsetQueryGenerator:
         alias = self._alias(tname)
         alias_cols = [(alias, cols)]
         distinct = 'DISTINCT ' if random.random() < 0.2 else ''
-        return (
+        sql = (
             f"SELECT {distinct}{self._select_list(alias_cols)} "
             f"FROM `{tname}` {alias}{self._where_clause(alias_cols)}"
         )
+        return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_inner_join_2(self) -> str:
         t1n, t1c = self.tables[0]
@@ -138,11 +144,12 @@ class SubsetQueryGenerator:
 
         alias_cols = [(a1, t1c), (a2, t2c)]
         distinct = 'DISTINCT ' if random.random() < 0.15 else ''
-        return (
+        sql = (
             f"SELECT {distinct}{self._select_list(alias_cols)} "
             f"FROM `{t1n}` {a1} INNER JOIN `{t2n}` {a2} ON {on}"
             f"{self._where_clause(alias_cols)}"
         )
+        return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_inner_join_3(self) -> str:
         if len(self.tables) < 3:
@@ -161,13 +168,14 @@ class SubsetQueryGenerator:
 
         alias_cols = [(a1, t1c), (a2, t2c), (a3, t3c)]
         distinct = 'DISTINCT ' if random.random() < 0.1 else ''
-        return (
+        sql = (
             f"SELECT {distinct}{self._select_list(alias_cols)} "
             f"FROM `{t1n}` {a1} "
             f"INNER JOIN `{t2n}` {a2} ON {on12} "
             f"INNER JOIN `{t3n}` {a3} ON {on23}"
             f"{self._where_clause(alias_cols)}"
         )
+        return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_self_join(self) -> str:
         tname, cols = random.choice(self.tables)
@@ -179,11 +187,12 @@ class SubsetQueryGenerator:
 
         alias_cols = [(a1, cols), (a2, cols)]
         distinct = 'DISTINCT ' if random.random() < 0.12 else ''
-        return (
+        sql = (
             f"SELECT {distinct}{self._select_list(alias_cols)} "
             f"FROM `{tname}` {a1} INNER JOIN `{tname}` {a2} ON {on}"
             f"{self._where_clause(alias_cols)}"
         )
+        return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_cross_join_filtered(self) -> str:
         if len(self.tables) < 2:
@@ -200,10 +209,46 @@ class SubsetQueryGenerator:
             return self._build_inner_join_2()
 
         where = self._merge_where(self._where_clause(alias_cols), pair_pred)
-        return (
+        sql = (
             f"SELECT {self._select_list(alias_cols)} "
             f"FROM `{t1n}` {a1} CROSS JOIN `{t2n}` {a2}{where}"
         )
+        return self._maybe_add_order_by(sql, alias_cols)
+
+    def _build_cte_wrapper(self) -> str:
+        tname, cols = random.choice(self.tables)
+        inner_a = self._alias('c')
+        inner_cols = random.sample(cols, k=min(random.randint(2, 4), len(cols)))
+        inner_sel = ', '.join(f"`{inner_a}`.`{c.name}` AS `{c.name}`" for c in inner_cols)
+        inner_sql = (
+            f"SELECT {inner_sel} FROM `{tname}` {inner_a}"
+            f"{self._where_clause([(inner_a, cols)])}"
+        )
+
+        cte_name = f"cte_{random.randint(1, 999)}"
+        cte_alias = self._alias('cte')
+        outer_alias_cols = [(cte_alias, inner_cols)]
+        outer_sel = self._select_list_from_col_defs(cte_alias, inner_cols)
+        outer_where = self._where_clause(outer_alias_cols)
+
+        if random.random() < 0.35:
+            other = [t for t in self.tables if t[0] != tname]
+            if other:
+                t2n, t2c = random.choice(other)
+                a2 = self._alias(t2n)
+                on = self._join_on_cold(cte_alias, inner_cols, a2, t2c)
+                if on:
+                    extra_templates = self._pick_projection_templates([(a2, t2c)], 1, min(2, len(t2c)))
+                    extra_sel = self._select_list_from_templates([(a2, t2c)], extra_templates)
+                    sql = (
+                        f"WITH {cte_name} AS ({inner_sql}) "
+                        f"SELECT {outer_sel}, {extra_sel} "
+                        f"FROM {cte_name} {cte_alias} INNER JOIN `{t2n}` {a2} ON {on}{outer_where}"
+                    )
+                    return self._maybe_add_order_by(sql, outer_alias_cols + [(a2, t2c)])
+
+        sql = f"WITH {cte_name} AS ({inner_sql}) SELECT {outer_sel} FROM {cte_name} {cte_alias}{outer_where}"
+        return self._maybe_add_order_by(sql, outer_alias_cols)
 
     def _build_derived_table(self) -> str:
         tname, cols = random.choice(self.tables)
@@ -230,12 +275,14 @@ class SubsetQueryGenerator:
                 if on:
                     extra_templates = self._pick_projection_templates([(a2, t2c)], 1, min(2, len(t2c)))
                     extra_sel = self._select_list_from_templates([(a2, t2c)], extra_templates)
-                    return (
+                    sql = (
                         f"SELECT {outer_sel}, {extra_sel} "
                         f"FROM ({inner_sql}) {sub_a} INNER JOIN `{t2n}` {a2} ON {on}{outer_where}"
                     )
+                    return self._maybe_add_order_by(sql, outer_alias_cols + [(a2, t2c)])
 
-        return f"SELECT {outer_sel} FROM ({inner_sql}) {sub_a}{outer_where}"
+        sql = f"SELECT {outer_sel} FROM ({inner_sql}) {sub_a}{outer_where}"
+        return self._maybe_add_order_by(sql, outer_alias_cols)
 
     def _build_in_subquery(self) -> str:
         tname, cols = self.tables[0]
@@ -261,7 +308,8 @@ class SubsetQueryGenerator:
             self._where_clause(alias_cols),
             f"`{alias}`.`{main_col.name}` IN ({subquery})",
         )
-        return f"SELECT {self._select_list(alias_cols)} FROM `{tname}` {alias}{where}"
+        sql = f"SELECT {self._select_list(alias_cols)} FROM `{tname}` {alias}{where}"
+        return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_exists_subquery(self) -> str:
         tname, cols = self.tables[0]
@@ -281,7 +329,8 @@ class SubsetQueryGenerator:
 
         alias_cols = [(alias, cols)]
         where = self._merge_where(self._where_clause(alias_cols), exists_pred)
-        return f"SELECT {self._select_list(alias_cols)} FROM `{tname}` {alias}{where}"
+        sql = f"SELECT {self._select_list(alias_cols)} FROM `{tname}` {alias}{where}"
+        return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_nested_derived(self) -> str:
         tname, cols = random.choice(self.tables)
@@ -304,10 +353,11 @@ class SubsetQueryGenerator:
 
         out_a = self._alias('o')
         out_alias_cols = [(out_a, mid_cols)]
-        return (
+        sql = (
             f"SELECT {self._select_list_from_col_defs(out_a, mid_cols)} "
             f"FROM ({mid_sql}) {out_a}{self._where_clause(out_alias_cols)}"
         )
+        return self._maybe_add_order_by(sql, out_alias_cols)
 
     def _build_union_all(self) -> str:
         if len(self.tables) >= 2 and random.random() < 0.45:
@@ -731,6 +781,43 @@ class SubsetQueryGenerator:
             return f"{where_sql} AND {predicate}"
         return f" WHERE {predicate}"
 
+    def _maybe_add_order_by(self, sql: str,
+                            alias_cols: List[Tuple[str, List[Any]]],
+                            prob: float = _ORDER_BY_PROB) -> str:
+        if random.random() >= prob:
+            return sql
+        expr = self._order_by_expr(alias_cols)
+        if not expr:
+            return sql
+        direction = 'DESC' if random.random() < 0.5 else 'ASC'
+        return f"{sql} ORDER BY {expr} {direction}"
+
+    def _order_by_expr(self, alias_cols: List[Tuple[str, List[Any]]]) -> Optional[str]:
+        refs = self._refs(alias_cols, prefer_non_pk=False)
+        if not refs:
+            return None
+        alias, col = random.choice(refs)
+        ref = f"`{alias}`.`{col.name}`"
+        dt = col.data_type
+        r = random.random()
+        if dt in _NUMERIC_FAMILY:
+            if r < 0.45:
+                return ref
+            if r < 0.75:
+                return f"ABS({ref})"
+            return f"COALESCE({ref}, 0)"
+        if dt == 'VARCHAR':
+            if r < 0.50:
+                return ref
+            if r < 0.80:
+                return f"LENGTH(COALESCE({ref}, ''))"
+            return f"UPPER({ref})"
+        if dt == 'DATE':
+            if r < 0.60:
+                return ref
+            return f"COALESCE({ref}, '2023-01-01')"
+        return ref
+
     def _validate_monotone_sql(self, sql: str) -> bool:
         normalized = re.sub(r'\s+', ' ', sql.upper()).strip()
         if not normalized:
@@ -749,7 +836,6 @@ class SubsetQueryGenerator:
             r'\bNOT\s+IN\b',
             r'\bNOT\s+EXISTS\b',
             r'\bNOT\s+BETWEEN\b',
-            r'\bWITH\b',
             r'\bRECURSIVE\b',
             r'\bOVER\s*\(',
             r'\bANY\s*\(',
