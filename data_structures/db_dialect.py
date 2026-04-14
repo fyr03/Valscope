@@ -177,6 +177,20 @@ class MySQLDialect(DBDialect):
         unique_clause = "UNIQUE" if is_unique else ""
         columns_str = ", ".join(columns)
         return f"CREATE {unique_clause} INDEX {index_name} ON {table_name} ({columns_str});"
+    
+    def supports_cte(self) -> bool:
+        """MySQL 8.0+ 支持 CTE"""
+        return True
+
+    def supports_function(self, name: str) -> bool:
+        """该方言是否可安全使用此函数名"""
+        return True  # MySQL 默认全部支持
+
+    def optimizer_family(self) -> str:
+        return 'mysql'
+
+    def supports_prefix_index_on_varchar(self) -> bool:
+        return True
 
 
 class PostgreSQLDialect(DBDialect):
@@ -319,7 +333,17 @@ class MariaDBDialect(MySQLDialect):
     def supports_math_equivalence_transformations(self) -> bool:
         """MariaDB's mathematical equivalence transformations might have issues, especially with MIN/MAX and negative value conversions"""
         return False
+    
+    def supports_cte(self) -> bool:
+        return True  # MariaDB 10.2+ 支持
 
+    def supports_function(self, name: str) -> bool:
+        # 这些函数在 MariaDB 上行为不稳定，产生误报概率更高
+        _NOISY = {'LOG', 'EXP', 'SIN', 'COS', 'TAN'}
+        return name not in _NOISY
+
+    def optimizer_family(self) -> str:
+        return 'mariadb'
 
 class TiDBDialect(MySQLDialect):
     """TiDB database dialect implementation"""
@@ -348,6 +372,14 @@ class PerconaDialect(MySQLDialect):
     @property
     def name(self):
         return "PERCONA"
+    
+    def supports_cte(self) -> bool:
+        # Percona 5.7 不支持 CTE；Percona 8.0+ 支持
+        # 保守起见降权而非完全禁用，通过 _choose_shape 权重控制
+        return True
+
+    def optimizer_family(self) -> str:
+        return 'percona'
 
 
 class PolarDBDialect(MySQLDialect):

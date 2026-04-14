@@ -31,3 +31,9 @@ python -u main.py
 # Ctrl+A 然后 D 挂起，SSH 断开也不影响
 # 回来后 screen -r valscope 恢复
 ```
+
+# Percona
+## Login Percona
+```
+~/percona/bin/mysql --defaults-file=$HOME/percona/my.cnf -u root
+```

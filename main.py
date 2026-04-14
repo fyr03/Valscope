@@ -20,7 +20,7 @@ if __name__ == '__main__':
     
     ##############################################################################
     
-    dialect_str = 'mysql'
+    dialect_str = 'percona'
     use_value_mutator = True
     run_hours = 12
     is_use_database_tables=False
@@ -30,10 +30,11 @@ if __name__ == '__main__':
     
     db_config={
                 'host': '127.0.0.1',
-                'port': 3307,
+                'port': 3310,
                 'database': 'test',
                 'user': 'sqlancer',
                 'password': 'sqlancer',
+                'db_type':  dialect_str,
             }
 
     ##############################################################################

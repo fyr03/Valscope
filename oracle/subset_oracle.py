@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
 from oracle.subset_query_gen import SubsetQueryGenerator
+from data_structures.db_dialect import get_current_dialect, set_current_dialect
 
 
 # ─────────────────────────────────────────────
@@ -40,13 +41,20 @@ SKEWED_EXPANSION_ROWS        = 500
 UNCHANGED_PLAN_VERIFY_PROB   = 0.15
 FLOAT_TOLERANCE              = 1e-9
 EXPECTED_MYSQL_RUNTIME_ERROR_CODES = {1365, 1690}
-EXPECTED_MYSQL_RUNTIME_ERROR_PATTERNS = (
-    'double value is out of range',
-    'bigint value is out of range',
-    'decimal value is out of range',
-    'division by 0',
-    'division by zero',
-)
+_RUNTIME_ERROR_CODES: dict = {
+    'mysql':    {1365, 1690},
+    'mariadb':  {1365, 1690, 1292},   # MariaDB 额外抛 1292（数据截断）
+    'percona':  {1365, 1690},
+}
+_RUNTIME_ERROR_PATTERNS: dict = {
+    'mysql':    ('double value is out of range', 'bigint value is out of range',
+                 'decimal value is out of range', 'division by 0', 'division by zero'),
+    'mariadb':  ('double value is out of range', 'bigint value is out of range',
+                 'decimal value is out of range', 'division by 0', 'division by zero',
+                 'incorrect datetime value', 'data too long'),
+    'percona':  ('double value is out of range', 'bigint value is out of range',
+                 'decimal value is out of range', 'division by 0', 'division by zero'),
+}
 
 
 # ─────────────────────────────────────────────
@@ -113,6 +121,15 @@ class SubsetOracle:
     def run(self) -> dict:
         uid             = uuid.uuid4().hex[:8]
         self._sql_log = []
+
+        db_type = self.db_config.get('db_type', 'MYSQL').upper()
+        set_current_dialect(db_type)          # 确保全局状态与本 round 一致
+        self._dialect = get_current_dialect() # 存入实例，后续方法可用
+
+        # 按方言选取运行时错误的判断表
+        family = self._dialect.optimizer_family()   # 'mysql' / 'mariadb' / 'percona'
+        self._ignorable_codes    = _RUNTIME_ERROR_CODES.get(family,    _RUNTIME_ERROR_CODES['mysql'])
+        self._ignorable_patterns = _RUNTIME_ERROR_PATTERNS.get(family, _RUNTIME_ERROR_PATTERNS['mysql'])
 
         round_stats = {
             'round_id': uid, 'queries': 0,
@@ -270,8 +287,11 @@ class SubsetOracle:
         for tbl in vs_tables:
             ddl = generate_create_table_sql(tbl)
             ddl = ddl.replace(f"CREATE TABLE {tbl.name}",
-                              f"CREATE TABLE {name_map[tbl.name]}")
+                            f"CREATE TABLE {name_map[tbl.name]}")
             ddl = self._strip_foreign_keys(ddl)
+            # MariaDB 不支持原生 JSON，替换为 LONGTEXT
+            if self._dialect.name.upper() == 'MARIADB':
+                ddl = re.sub(r'\bJSON\b', 'LONGTEXT', ddl, flags=re.IGNORECASE)
             self._exec_ddl(conn, ddl)
             self._log(f"  Created: {name_map[tbl.name]}")
 
@@ -353,15 +373,23 @@ class SubsetOracle:
         gen = SubsetQueryGenerator(
             tables=tables,
             skew_hot_values={name_map[vs_tables[0].name]: skew.hot_values_by_col},
+            dialect=self._dialect,
         )
 
         results: Dict[str, Tuple[QuerySpec, QuerySnapshot]] = {}
+        min_main_table_queries = TARGET_BASELINE_QUERIES // 2
         for _ in range(MAX_QUERY_GEN_ATTEMPTS):
             if len(results) >= TARGET_BASELINE_QUERIES:
                 break
             sql = gen.generate()
             if not sql or sql in results:
                 continue
+
+            # 如果主表查询还不够，跳过不涉及主表的 SQL
+            main_table_count = sum(1 for s in results if main_name in s)
+            if main_table_count < min_main_table_queries and main_name not in sql:
+                continue
+
             snap = self._execute_snapshot(conn, sql, numeric_cols)
             if snap is None or not snap.count:
                 continue
@@ -706,13 +734,30 @@ class SubsetOracle:
         rows = []
         try:
             with conn.cursor() as cur:
-                cur.execute(f"EXPLAIN FORMAT=TRADITIONAL {select_sql}")
+                cur.execute(f"EXPLAIN {select_sql}")   # 去掉 FORMAT=TRADITIONAL，兼容性更好
+                if not cur.description:
+                    return rows
+                col_names = [d[0].lower() for d in cur.description]
+
+                def gcol(row, name):
+                    try:
+                        v = row[col_names.index(name)]
+                        return str(v) if v is not None else 'null'
+                    except (ValueError, IndexError):
+                        return 'null'
+
                 for row in cur.fetchall():
-                    def g(i): return str(row[i]) if row[i] is not None else 'null'
                     rows.append(
-                        f"id={g(0)};select_type={g(1)};table={g(2)};"
-                        f"type={g(4)};possible_keys={g(5)};key={g(6)};"
-                        f"key_len={g(7)};rows={g(9)};filtered={g(10)};extra={g(11)}"
+                        f"id={gcol(row,'id')};"
+                        f"select_type={gcol(row,'select_type')};"
+                        f"table={gcol(row,'table')};"
+                        f"type={gcol(row,'type')};"
+                        f"possible_keys={gcol(row,'possible_keys')};"
+                        f"key={gcol(row,'key')};"
+                        f"key_len={gcol(row,'key_len')};"
+                        f"rows={gcol(row,'rows')};"
+                        f"filtered={gcol(row,'filtered')};"
+                        f"extra={gcol(row,'extra')}"
                     )
         except Exception as e:
             self._log(f"  EXPLAIN failed: {e}")
@@ -864,11 +909,11 @@ class SubsetOracle:
             if isinstance(first, int):
                 code = first
 
-        if code in EXPECTED_MYSQL_RUNTIME_ERROR_CODES:
+        if code in self._ignorable_codes:
             return True
 
         msg = str(err).lower()
-        return any(pat in msg for pat in EXPECTED_MYSQL_RUNTIME_ERROR_PATTERNS)
+        return any(pat in msg for pat in self._ignorable_patterns)
 
     # ──────────────────────────────────────────
     # 日志
