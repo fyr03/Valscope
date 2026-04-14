@@ -39,6 +39,14 @@ BASELINE_NOISE_ROWS          = 4
 SKEWED_EXPANSION_ROWS        = 500
 UNCHANGED_PLAN_VERIFY_PROB   = 0.15
 FLOAT_TOLERANCE              = 1e-9
+EXPECTED_MYSQL_RUNTIME_ERROR_CODES = {1365, 1690}
+EXPECTED_MYSQL_RUNTIME_ERROR_PATTERNS = (
+    'double value is out of range',
+    'bigint value is out of range',
+    'decimal value is out of range',
+    'division by 0',
+    'division by zero',
+)
 
 
 # ─────────────────────────────────────────────
@@ -76,6 +84,10 @@ class QuerySnapshot:
     min_values:   Dict[str, Optional[float]]     = field(default_factory=dict)
     row_digests:  Dict[str, int]                 = field(default_factory=dict)
     explain_plan: List[str]                      = field(default_factory=list)
+
+
+class IgnorableQueryRuntimeError(Exception):
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -191,22 +203,32 @@ class SubsetOracle:
                 s2_plan      = self._capture_explain(conn, spec.select_sql)
                 plan_changed = not self._plans_equivalent(s1_snap.explain_plan, s2_plan)
                 self._log(f"  Query[{i+1}] plan_changed={plan_changed}")
+                self._log(f"  Query[{i+1}] SQL: {spec.select_sql}")
+                self._log(f"  Query[{i+1}] Plan S1: {self._fmt_plan(s1_snap.explain_plan)}")
+                self._log(f"  Query[{i+1}] Plan S2: {self._fmt_plan(s2_plan)}")
 
                 if not plan_changed and random.random() > UNCHANGED_PLAN_VERIFY_PROB:
                     self._log(f"  Query[{i+1}] plan unchanged, skipping.")
                     continue
 
-                round_stats['queries'] += 1
-                if plan_changed:
-                    round_stats['plan_changes'] += 1
-
                 # S2 快照：与 S1 使用完全相同的方法，保证可比性
                 s2_snap = self._execute_snapshot(conn, spec.select_sql, numeric_cols)
+                if s2_snap is None:
+                    self._log(f"  Query[{i+1}] skipped due to expected query runtime error.")
+                    continue
                 s2_snap.explain_plan = s2_plan
 
                 try:
                     self._verify(conn, spec, s1_snap, s2_snap, numeric_cols)
+                    round_stats['queries'] += 1
+                    if plan_changed:
+                        round_stats['plan_changes'] += 1
+                except IgnorableQueryRuntimeError as e:
+                    self._log(f"  Query[{i+1}] skipped during verification: {e}")
                 except AssertionError as e:
+                    round_stats['queries'] += 1
+                    if plan_changed:
+                        round_stats['plan_changes'] += 1
                     round_stats['bugs'] += 1
                     self._log_bug(str(e), spec, s1_snap, s2_snap, uid)
 
@@ -373,6 +395,9 @@ class SubsetOracle:
                 snap.row_digests = self._capture_row_digests(conn, sql)
 
             snap.explain_plan = self._capture_explain(conn, sql)
+        except IgnorableQueryRuntimeError as e:
+            self._log(f"  snapshot skipped: {e}")
+            return None
         except Exception as e:
             self._log(f"  snapshot failed: {e}")
             return None
@@ -670,6 +695,8 @@ class SubsetOracle:
                     d = self._row_digest(row)
                     digests[d] = digests.get(d, 0) + 1
         except Exception as e:
+            if self._is_expected_query_runtime_error(e):
+                raise IgnorableQueryRuntimeError(str(e)) from e
             self._log(f"  row digest capture failed: {e}")
         return digests
 
@@ -758,6 +785,8 @@ class SubsetOracle:
                 row = cur.fetchone()
                 return int(row[0]) if row and row[0] is not None else None
         except Exception as e:
+            if self._is_expected_query_runtime_error(e):
+                raise IgnorableQueryRuntimeError(str(e)) from e
             self._log(f"  exec_single_int failed: {e}")
             return None
 
@@ -768,6 +797,8 @@ class SubsetOracle:
                 row = cur.fetchone()
                 return float(row[0]) if row and row[0] is not None else None
         except Exception as e:
+            if self._is_expected_query_runtime_error(e):
+                raise IgnorableQueryRuntimeError(str(e)) from e
             self._log(f"  exec_single_float failed: {e}")
             return None
 
@@ -777,6 +808,19 @@ class SubsetOracle:
                 cur.execute(f"DROP TABLE IF EXISTS {table_name}")
         except Exception:
             pass
+
+    def _is_expected_query_runtime_error(self, err: Exception) -> bool:
+        code = None
+        if getattr(err, 'args', None):
+            first = err.args[0]
+            if isinstance(first, int):
+                code = first
+
+        if code in EXPECTED_MYSQL_RUNTIME_ERROR_CODES:
+            return True
+
+        msg = str(err).lower()
+        return any(pat in msg for pat in EXPECTED_MYSQL_RUNTIME_ERROR_PATTERNS)
 
     # ──────────────────────────────────────────
     # 日志
