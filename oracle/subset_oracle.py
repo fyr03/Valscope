@@ -33,7 +33,7 @@ from data_structures.db_dialect import get_current_dialect, set_current_dialect
 # ─────────────────────────────────────────────
 TARGET_BASELINE_QUERIES      = 6
 MIN_BASELINE_QUERIES         = 3
-MAX_QUERY_GEN_ATTEMPTS       = 72
+MAX_QUERY_GEN_ATTEMPTS       = 120
 BASELINE_HOT_ROWS            = 2
 BASELINE_RANDOM_ROWS         = 4
 BASELINE_NOISE_ROWS          = 4
@@ -56,6 +56,9 @@ _RUNTIME_ERROR_PATTERNS: dict = {
                  'decimal value is out of range', 'division by 0', 'division by zero'),
 }
 
+_STRING_LIKE_TYPES = ('VARCHAR', 'TEXT', 'LONGTEXT')
+_INDEXABLE_TYPES   = ('INT', 'VARCHAR', 'TEXT', 'LONGTEXT', 'DATE')
+
 
 # ─────────────────────────────────────────────
 # 数据类
@@ -63,7 +66,7 @@ _RUNTIME_ERROR_PATTERNS: dict = {
 @dataclass
 class ColDef:
     name: str
-    data_type: str       # 'INT' / 'VARCHAR' / 'FLOAT' / 'DOUBLE' / 'DECIMAL'
+    data_type: str       # 'INT' / 'VARCHAR' / 'TEXT' / 'LONGTEXT' / 'DATE' / ...
     is_primary_key: bool = False
     is_nullable: bool    = True
     varchar_len: int     = 128
@@ -307,8 +310,12 @@ class SubsetOracle:
         for c in vs_table.columns:
             dt = c.data_type.upper()
             if dt.startswith('VARCHAR') or dt.startswith('CHAR') \
-                    or 'TEXT' in dt or 'ENUM' in dt or 'SET(' in dt:
+                    or 'ENUM' in dt or 'SET(' in dt:
                 base_dt, vlen = 'VARCHAR', 255
+            elif 'LONGTEXT' in dt or 'MEDIUMTEXT' in dt:
+                base_dt, vlen = 'LONGTEXT', 1024
+            elif 'TEXT' in dt:
+                base_dt, vlen = 'TEXT', 512
             elif dt.startswith('DECIMAL') or dt.startswith('NUMERIC'):
                 base_dt, vlen = 'DECIMAL', 128
             elif 'FLOAT' in dt:
@@ -338,6 +345,7 @@ class SubsetOracle:
         primary_keys_dict = {tbl.name: list(range(1, 21)) for tbl in vs_tables}
         for tbl in vs_tables[1:]:
             actual = name_map[tbl.name]
+            coldefs = self._vs_table_to_coldefs(tbl)
             try:
                 insert_sql = generate_insert_sql(
                     tbl, num_rows=10,
@@ -356,6 +364,7 @@ class SubsetOracle:
                         self._exec_dml(conn, line.rstrip(';'))
                     except Exception as e:
                         self._log(f"  aux insert skipped: {e}")
+                self._insert_aux_coercion_rows(conn, actual, coldefs)
             except Exception as e:
                 self._log(f"  aux data gen failed for {actual}: {e}")
 
@@ -378,8 +387,13 @@ class SubsetOracle:
 
         results: Dict[str, Tuple[QuerySpec, QuerySnapshot]] = {}
         min_main_table_queries = TARGET_BASELINE_QUERIES // 2
+        min_risky_queries = 1 if len(vs_tables) > 1 else 0
         for _ in range(MAX_QUERY_GEN_ATTEMPTS):
-            if len(results) >= TARGET_BASELINE_QUERIES:
+            risky_count = sum(
+                1 for s in results
+                if 'implicit_conversion_' in s.lower()
+            )
+            if len(results) >= TARGET_BASELINE_QUERIES and risky_count >= min_risky_queries:
                 break
             sql = gen.generate()
             if not sql or sql in results:
@@ -447,7 +461,11 @@ class SubsetOracle:
     # ──────────────────────────────────────────
     def _choose_predicate_col(self, cols: List[ColDef]) -> ColDef:
         preferred = [c for c in cols if not c.is_primary_key
-                     and c.data_type in ('INT', 'VARCHAR', 'FLOAT', 'DOUBLE', 'DECIMAL')]
+                     and c.data_type in ('DATE', 'VARCHAR', 'TEXT', 'LONGTEXT')]
+        if preferred and random.random() < 0.75:
+            return random.choice(preferred)
+        preferred = [c for c in cols if not c.is_primary_key
+                     and c.data_type in ('INT', 'FLOAT', 'DOUBLE', 'DECIMAL')]
         if preferred:
             return random.choice(preferred)
         non_pk = [c for c in cols if not c.is_primary_key]
@@ -463,7 +481,7 @@ class SubsetOracle:
             c for c in cols
             if c.name != pred_col.name
             and not c.is_primary_key
-            and c.data_type in ('INT', 'VARCHAR', 'DATE')
+            and c.data_type in _INDEXABLE_TYPES
         ]
 
         if candidates:
@@ -477,9 +495,9 @@ class SubsetOracle:
 
         comp_candidates = [
             c for c in cols
-            if not c.is_primary_key and c.data_type in ('INT', 'VARCHAR', 'DATE')
+            if not c.is_primary_key and c.data_type in _INDEXABLE_TYPES
         ]
-        pred_eligible = pred_col.data_type in ('INT', 'VARCHAR', 'DATE') and not pred_col.is_primary_key
+        pred_eligible = pred_col.data_type in _INDEXABLE_TYPES and not pred_col.is_primary_key
         if pred_eligible and len(comp_candidates) >= 2 and random.random() < 0.8:
             others = [c for c in comp_candidates if c.name != pred_col.name]
             if others:
@@ -500,8 +518,9 @@ class SubsetOracle:
             )
 
     def _index_expr(self, col: ColDef) -> str:
-        if col.data_type == 'VARCHAR':
-            prefix_len = min(max(1, col.varchar_len), 64)
+        if col.data_type in _STRING_LIKE_TYPES:
+            max_prefix = 32 if col.data_type == 'LONGTEXT' else 64
+            prefix_len = min(max(1, col.varchar_len), max_prefix)
             return f"`{col.name}`({prefix_len})"
         return f"`{col.name}`"
 
@@ -522,13 +541,15 @@ class SubsetOracle:
     def _create_hot_values(self, col: ColDef) -> List[str]:
         dt = col.data_type
         if dt == 'DATE':
-            return ['NULL']
+            return ["'not-a-date'", "'2023-01-01'", "'0000-00-00'"]
         if dt == 'INT':
             a = random.randint(-16, 16)
             return [str(a), str(a+1+random.randint(0,3)), str(a-1-random.randint(0,3))]
-        if dt == 'VARCHAR':
+        if dt in _STRING_LIKE_TYPES:
             s = f"hv_{random.randint(100,9999)}"
-            return [f"'{s}'", f"'{s}_a'", f"'{s}_b'"]
+            if dt == 'LONGTEXT':
+                return [f"'{s}'", "'not-a-date'", "'2023-01-01 00:00:00'"]
+            return [f"'{s}'", "'not-a-date'", "'2023-01-01'"]
         if dt in ('FLOAT', 'DOUBLE'):
             a = random.randint(-200, 200) / 10.0
             return [f"{a:.3f}", f"{a+1.0:.3f}", f"{a-1.0:.3f}"]
@@ -546,9 +567,16 @@ class SubsetOracle:
                 c = str(base + 20 + i)
                 if c not in existing: return c
             return str(base + 40)
-        if dt == 'VARCHAR':
+        if dt == 'DATE':
+            return f"'{2030 + random.randint(0, 9)}-12-{random.randint(10, 28):02d}'"
+        if dt in _STRING_LIKE_TYPES:
             for i in range(16):
-                c = f"'exp_{random.randint(1000,9999)}_{i}'"
+                if i % 3 == 0:
+                    c = f"'{2030 + i}-01-{random.randint(10, 28):02d}'"
+                elif i % 3 == 1:
+                    c = f"'exp_{random.randint(1000,9999)}_{i}'"
+                else:
+                    c = f"'{random.randint(1000, 9999)}'"
                 if c not in existing: return c
             return f"'exp_final_{len(existing)}'"
         if dt in ('FLOAT', 'DOUBLE'):
@@ -592,8 +620,16 @@ class SubsetOracle:
             dt = c.data_type
             if dt == 'INT':
                 boundary_map[c.name] = ['0','1','-1','2147483647','-2147483648','NULL']
-            elif dt == 'VARCHAR':
-                boundary_map[c.name] = ["''","'NULL'","'0'","'%'","'_'","NULL"]
+            elif dt == 'DATE':
+                boundary_map[c.name] = [
+                    "'0000-00-00'", "'1000-01-01'", "'9999-12-31'",
+                    "'not-a-date'", "''", "'2023-02-29'", 'NULL'
+                ]
+            elif dt in _STRING_LIKE_TYPES:
+                boundary_map[c.name] = [
+                    "''", "'NULL'", "'0'", "'1'", "'0000-00-00'",
+                    "'2023-01-01'", "'not-a-date'", "'%'", "'_'", 'NULL'
+                ]
             elif dt in ('FLOAT','DOUBLE'):
                 boundary_map[c.name] = ['0','0.0','-0.0','1.0','-1.0',
                                          '3.4028235E38','-3.4028235E38','NULL']
@@ -627,12 +663,54 @@ class SubsetOracle:
                 return exp_hot
             return random.choice(hot_vals)
         if dt == 'INT':    return str(random.randint(-1000, 1000))
-        if dt == 'VARCHAR':
-            n = random.randint(1, 20)
-            return f"'{''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789_', k=n))}'"
+        if dt == 'DATE':
+            return random.choice([
+                f"'{random.randint(1990, 2038)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}'",
+                "'not-a-date'",
+                "'0000-00-00'",
+                "''",
+            ])
+        if dt in _STRING_LIKE_TYPES:
+            if random.random() < 0.45:
+                return random.choice([
+                    "'0'", "'1'", "'-1'", "'0000-00-00'",
+                    "'2023-01-01'", "'2023-01-01 00:00:00'",
+                    "'not-a-date'", "'01e0'", "' 1'", "''",
+                ])
+            n = random.randint(8, 64 if dt == 'LONGTEXT' else 20)
+            token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789_-:/ ', k=n)).rstrip()
+            return f"'{token or 'seed'}'"
         if dt in ('FLOAT','DOUBLE'): return f"{random.uniform(-1000, 1000):.3f}"
         if dt == 'DECIMAL':          return f"{random.uniform(-1000, 1000):.2f}"
         return 'NULL'
+
+    def _insert_aux_coercion_rows(self, conn, table_name: str, cols: List[ColDef], rows: int = 8):
+        for i in range(rows):
+            vals: List[str] = []
+            for c in cols:
+                if c.is_primary_key:
+                    vals.append(str(9_000_000 + i))
+                    continue
+                dt = c.data_type
+                if dt == 'INT':
+                    vals.append(random.choice(['0', '1', '-1', '20230101']))
+                elif dt == 'DATE':
+                    vals.append(random.choice([
+                        "'not-a-date'", "'2023-01-01'", "'0000-00-00'", "'1999-12-31'", 'NULL'
+                    ]))
+                elif dt in _STRING_LIKE_TYPES:
+                    vals.append(random.choice([
+                        "'0'", "'1'", "'-1'", "'0000-00-00'",
+                        "'2023-01-01'", "'2023-01-01 00:00:00'",
+                        "'not-a-date'", "'sample_text'", "''"
+                    ]))
+                elif dt in ('FLOAT', 'DOUBLE'):
+                    vals.append(random.choice(['0.0', '1.0', '-1.0']))
+                elif dt == 'DECIMAL':
+                    vals.append(random.choice(['0.00', '1.00', '-1.00']))
+                else:
+                    vals.append('NULL')
+            self._try_insert(conn, table_name, cols, vals)
 
     def _try_insert(self, conn, table_name: str, cols: List[ColDef], vals: List[str]):
         col_names = ', '.join(f'`{c.name}`' for c in cols)

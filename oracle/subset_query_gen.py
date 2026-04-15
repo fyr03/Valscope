@@ -27,10 +27,11 @@ _STR_SCALAR_FUNS: List[str] = [
 
 _ARITH_OPS: List[str] = ['+', '-', '*']
 
-_NO_JOIN_TYPES: frozenset = frozenset({'FLOAT', 'DOUBLE', 'DECIMAL', 'DATE', 'OPAQUE'})
+_NO_JOIN_TYPES: frozenset = frozenset({'FLOAT', 'DOUBLE', 'DECIMAL', 'OPAQUE'})
 _INT_FAMILY: frozenset = frozenset({'INT', 'BIGINT', 'SMALLINT', 'TINYINT'})
 _NUMERIC_FAMILY: frozenset = frozenset({'INT', 'BIGINT', 'SMALLINT', 'TINYINT',
                                         'FLOAT', 'DOUBLE', 'DECIMAL'})
+_STRING_FAMILY: frozenset = frozenset({'VARCHAR', 'TEXT', 'LONGTEXT'})
 
 _SELECT_MIN_COLS = 1
 _SELECT_MAX_COLS = 5
@@ -60,6 +61,7 @@ class SubsetQueryGenerator:
         builders = {
             'SINGLE': self._build_single,
             'INNER_JOIN_2': self._build_inner_join_2,
+            'IMPLICIT_CONVERSION_JOIN': self._build_implicit_conversion_join,
             'INNER_JOIN_3': self._build_inner_join_3,
             'SELF_JOIN': self._build_self_join,
             'CROSS_JOIN_FILTERED': self._build_cross_join_filtered,
@@ -104,6 +106,7 @@ class SubsetQueryGenerator:
             pool = [
                 ('SINGLE', 8),
                 ('INNER_JOIN_2', 24),
+                ('IMPLICIT_CONVERSION_JOIN', 16),
                 ('SELF_JOIN', 10),
                 ('CROSS_JOIN_FILTERED', 10),
                 ('CTE_WRAPPER', cte_w),
@@ -117,6 +120,7 @@ class SubsetQueryGenerator:
             pool = [
                 ('SINGLE', 6),
                 ('INNER_JOIN_2', 20),
+                ('IMPLICIT_CONVERSION_JOIN', 14),
                 ('INNER_JOIN_3', 14),
                 ('SELF_JOIN', 10),
                 ('CROSS_JOIN_FILTERED', 8),
@@ -164,6 +168,33 @@ class SubsetQueryGenerator:
             f"{self._where_clause(alias_cols)}"
         )
         return self._maybe_add_order_by(sql, alias_cols)
+
+    def _build_implicit_conversion_join(self) -> str:
+        if len(self.tables) < 2:
+            return self._build_single()
+
+        t1n, t1c = self.tables[0]
+        other = [t for t in self.tables if t[0] != t1n]
+        random.shuffle(other)
+
+        for t2n, t2c in other:
+            pair = self._pick_risky_join_pair(t1c, t2c)
+            if not pair:
+                continue
+
+            c1, c2 = pair
+            a1 = self._alias(t1n)
+            a2 = self._alias(t2n)
+            alias_cols = [(a1, t1c), (a2, t2c)]
+            on = f"{self._qref(a1, c1.name)} = {self._qref(a2, c2.name)}"
+            sql = (
+                f"SELECT /*implicit_conversion_join*/ {self._select_list(alias_cols)} "
+                f"FROM {self._qi(t1n)} {a1} INNER JOIN {self._qi(t2n)} {a2} ON {on}"
+                f"{self._where_clause(alias_cols)}"
+            )
+            return self._maybe_add_order_by(sql, alias_cols)
+
+        return self._build_inner_join_2()
 
     def _build_inner_join_3(self) -> str:
         if len(self.tables) < 3:
@@ -305,7 +336,11 @@ class SubsetQueryGenerator:
     def _build_in_subquery(self) -> str:
         tname, cols = self.tables[0]
         alias = self._alias(tname)
-        candidates = [c for c in cols if c.data_type in ('INT', 'VARCHAR') and not c.is_primary_key]
+        candidates = [
+            c for c in cols
+            if not c.is_primary_key
+            and (c.data_type in ('INT', 'DATE') or self._is_string_like_type(c.data_type))
+        ]
         if not candidates:
             return self._build_single()
         main_col = random.choice(candidates)
@@ -326,7 +361,8 @@ class SubsetQueryGenerator:
             self._where_clause(alias_cols),
             f"{self._qref(alias, main_col.name)} IN ({subquery})",
         )
-        sql = f"SELECT {self._select_list(alias_cols)} FROM {self._qi(tname)} {alias}{where}"
+        comment = " /*implicit_conversion_in*/" if self._is_risky_cross_type_pair(main_col, sub_col) else ''
+        sql = f"SELECT{comment} {self._select_list(alias_cols)} FROM {self._qi(tname)} {alias}{where}"
         return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_exists_subquery(self) -> str:
@@ -506,7 +542,7 @@ class SubsetQueryGenerator:
                 return f"(CASE WHEN {base} >= {threshold} THEN {base} ELSE {threshold} END)"
             return base
 
-        if dt == 'VARCHAR':
+        if self._is_string_like_type(dt):
             other = self._pick_compatible_ref(alias_cols, col, alias)
             empty_str = self._lit('', 'VARCHAR')
             if r < 0.18 and self._str_funs:
@@ -550,7 +586,7 @@ class SubsetQueryGenerator:
             if r < 0.80:
                 return f"{self._fn('ABS')}({base})"
             return f"({base} + {random.randint(0, 5)})"
-        if dt == 'VARCHAR':
+        if self._is_string_like_type(dt):
             empty_str = self._lit('', 'VARCHAR')
             if r < 0.40:
                 return base
@@ -620,7 +656,8 @@ class SubsetQueryGenerator:
         if dt == 'DATE':
             other = self._pick_compatible_ref(alias_cols, col, alias)
             if other and r < 0.35:
-                return f"{ref} >= {self._qref(other[0], other[1].name)}"
+                op = '=' if self._is_risky_cross_type_pair(col, other[1]) else '>='
+                return f"{ref} {op} {self._qref(other[0], other[1].name)}"
             return f"{ref} IS NOT NULL" if r < 0.65 else f"{ref} IS NULL"
         
         if dt == 'OPAQUE':
@@ -641,7 +678,8 @@ class SubsetQueryGenerator:
             if r < 0.52:
                 return f"{ref} BETWEEN {v1} AND {v2}"
             if r < 0.62 and other:
-                return f"{ref} {random.choice(['=', '>=', '<='])} {self._qref(other[0], other[1].name)}"
+                op = '=' if self._is_risky_cross_type_pair(col, other[1]) else random.choice(['=', '>=', '<='])
+                return f"{ref} {op} {self._qref(other[0], other[1].name)}"
             if r < 0.72:
                 return f"{self._fn('ABS')}({ref}) >= {abs(int(float(v1)))}"
             if r < 0.80:
@@ -653,7 +691,7 @@ class SubsetQueryGenerator:
             lits = [str(random.randint(-200, 200)) for _ in range(random.randint(2, 5))]
             return f"{ref} IN ({', '.join(lits)})"
 
-        if dt == 'VARCHAR':
+        if self._is_string_like_type(dt):
             v = hot or self._lit(f"val{random.randint(0, 99)}", 'VARCHAR')
             inner = v.strip("'")
             prefix = (inner[:2] if len(inner) >= 2 else inner) or 'v'
@@ -696,7 +734,8 @@ class SubsetQueryGenerator:
             if r < 0.56:
                 return f"{ref} BETWEEN {v1} AND {v2}"
             if r < 0.68 and other:
-                return f"{ref} {random.choice(['>=', '<='])} {self._qref(other[0], other[1].name)}"
+                op = '=' if self._is_risky_cross_type_pair(col, other[1]) else random.choice(['>=', '<='])
+                return f"{ref} {op} {self._qref(other[0], other[1].name)}"
             if r < 0.80:
                 return f"{self._fn('ABS')}({ref}) >= {abs(float(v1)):.3f}"
             if r < 0.90:
@@ -734,12 +773,30 @@ class SubsetQueryGenerator:
             return None
         exact = [c for c in cols if c.data_type == ref.data_type]
         if exact:
-            return random.choice(exact)
+            if random.random() < 0.55:
+                return random.choice(exact)
         if ref.data_type in _INT_FAMILY:
             loose = [c for c in cols if c.data_type in _INT_FAMILY]
             if loose:
-                return random.choice(loose)
-        return None
+                if random.random() < 0.55:
+                    return random.choice(loose)
+        if self._is_string_like_type(ref.data_type):
+            loose = [c for c in cols if self._is_string_like_type(c.data_type)]
+            if loose:
+                if random.random() < 0.55:
+                    return random.choice(loose)
+        risky = [c for c in cols if self._is_risky_cross_type_pair(ref, c)]
+        if risky and random.random() < 0.75:
+            return random.choice(risky)
+        compat = [c for c in cols if self._pairwise_type_compatible(ref, c)]
+        return random.choice(compat) if compat else None
+
+    def _pick_risky_join_pair(self, cols1: List[Any], cols2: List[Any]) -> Optional[Tuple[Any, Any]]:
+        pairs = [
+            (c1, c2) for c1 in cols1 for c2 in cols2
+            if self._is_risky_cross_type_pair(c1, c2)
+        ]
+        return random.choice(pairs) if pairs else None
 
     def _pair_predicate_from_alias_cols(self,
                                         alias_cols: List[Tuple[str, List[Any]]],
@@ -777,13 +834,18 @@ class SubsetQueryGenerator:
         ref2 = self._qref(a2, c2.name)
         dt = c1.data_type
 
+        if self._is_risky_cross_type_pair(c1, c2):
+            if not allow_equality:
+                return None
+            return f"{ref1} = {ref2}"
+
         if dt in _NUMERIC_FAMILY or dt == 'DATE':
             ops = ['>=', '<='] if prefer_nontrivial else ['=', '>=', '<=']
             if not allow_equality and '=' in ops:
                 ops.remove('=')
             return f"{ref1} {random.choice(ops)} {ref2}"
 
-        if dt == 'VARCHAR':
+        if self._is_string_like_type(dt):
             if allow_equality and not prefer_nontrivial:
                 return f"{ref1} = {ref2}"
             empty_str = self._lit('', 'VARCHAR')
@@ -803,11 +865,18 @@ class SubsetQueryGenerator:
             return False
         if c1.data_type == c2.data_type:
             return True
+        if self._is_string_like_type(c1.data_type) and self._is_string_like_type(c2.data_type):
+            return True
+        if self._is_risky_cross_type_pair(c1, c2):
+            return True
         return c1.data_type in _NUMERIC_FAMILY and c2.data_type in _NUMERIC_FAMILY
 
     def _same_comparable_type(self, c1: Any, c2: Any) -> bool:
-        return c1.data_type == c2.data_type or (
-            c1.data_type in _INT_FAMILY and c2.data_type in _INT_FAMILY
+        return (
+            c1.data_type == c2.data_type
+            or (c1.data_type in _INT_FAMILY and c2.data_type in _INT_FAMILY)
+            or (self._is_string_like_type(c1.data_type) and self._is_string_like_type(c2.data_type))
+            or self._is_risky_cross_type_pair(c1, c2)
         )
 
     def _pick_compatible_ref(self,
@@ -861,7 +930,7 @@ class SubsetQueryGenerator:
             if r < 0.75:
                 return f"{self._fn('ABS')}({ref})"
             return f"COALESCE({ref}, 0)"
-        if dt == 'VARCHAR':
+        if self._is_string_like_type(dt):
             if r < 0.50:
                 return ref
             if r < 0.80:
@@ -945,10 +1014,29 @@ class SubsetQueryGenerator:
             is_quoted = candidate.startswith("'")
             if col.data_type in _NUMERIC_FAMILY and is_quoted:
                 return None
-            if col.data_type == 'VARCHAR' and not is_quoted and candidate != 'NULL':
+            if self._is_string_like_type(col.data_type) and not is_quoted and candidate != 'NULL':
                 return None
             return candidate
         return None
+
+    def _is_string_like_type(self, data_type: str) -> bool:
+        return data_type in _STRING_FAMILY
+
+    def _is_risky_cross_type_pair(self, c1: Any, c2: Any) -> bool:
+        if c1.data_type == 'OPAQUE' or c2.data_type == 'OPAQUE':
+            return False
+        if c1.data_type == c2.data_type:
+            return False
+        left_num = c1.data_type in _NUMERIC_FAMILY
+        right_num = c2.data_type in _NUMERIC_FAMILY
+        left_str = self._is_string_like_type(c1.data_type)
+        right_str = self._is_string_like_type(c2.data_type)
+        left_date = c1.data_type == 'DATE'
+        right_date = c2.data_type == 'DATE'
+        return (
+            (left_date and right_str) or (right_date and left_str)
+            or (left_num and right_str) or (right_num and left_str)
+        )
 
     def _alias(self, base: str) -> str:
         self._ctr += 1
