@@ -37,3 +37,7 @@ python -u main.py
 ```
 ~/percona/bin/mysql --defaults-file=$HOME/percona/my.cnf -u root
 ```
+## replay
+```
+python percona_replay.py --input replay_in.sql --output replay_out.log
+```
