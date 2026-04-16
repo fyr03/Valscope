@@ -31,7 +31,8 @@ _NO_JOIN_TYPES: frozenset = frozenset({'FLOAT', 'DOUBLE', 'DECIMAL', 'OPAQUE'})
 _INT_FAMILY: frozenset = frozenset({'INT', 'BIGINT', 'SMALLINT', 'TINYINT'})
 _NUMERIC_FAMILY: frozenset = frozenset({'INT', 'BIGINT', 'SMALLINT', 'TINYINT',
                                         'FLOAT', 'DOUBLE', 'DECIMAL'})
-_STRING_FAMILY: frozenset = frozenset({'VARCHAR', 'TEXT', 'LONGTEXT'})
+_STRING_FAMILY: frozenset = frozenset({'VARCHAR', 'TEXT', 'LONGTEXT', 'CHAR', 'ENUM', 'SET'})
+_TEMPORAL_FAMILY: frozenset = frozenset({'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR'})
 
 _SELECT_MIN_COLS = 1
 _SELECT_MAX_COLS = 5
@@ -62,6 +63,7 @@ class SubsetQueryGenerator:
             'SINGLE': self._build_single,
             'INNER_JOIN_2': self._build_inner_join_2,
             'IMPLICIT_CONVERSION_JOIN': self._build_implicit_conversion_join,
+            'RARE_BEHAVIOR_JOIN': self._build_rare_behavior_join,
             'INNER_JOIN_3': self._build_inner_join_3,
             'SELF_JOIN': self._build_self_join,
             'CROSS_JOIN_FILTERED': self._build_cross_join_filtered,
@@ -107,6 +109,7 @@ class SubsetQueryGenerator:
                 ('SINGLE', 8),
                 ('INNER_JOIN_2', 24),
                 ('IMPLICIT_CONVERSION_JOIN', 16),
+                ('RARE_BEHAVIOR_JOIN', 18),
                 ('SELF_JOIN', 10),
                 ('CROSS_JOIN_FILTERED', 10),
                 ('CTE_WRAPPER', cte_w),
@@ -121,6 +124,7 @@ class SubsetQueryGenerator:
                 ('SINGLE', 6),
                 ('INNER_JOIN_2', 20),
                 ('IMPLICIT_CONVERSION_JOIN', 14),
+                ('RARE_BEHAVIOR_JOIN', 16),
                 ('INNER_JOIN_3', 14),
                 ('SELF_JOIN', 10),
                 ('CROSS_JOIN_FILTERED', 8),
@@ -194,6 +198,29 @@ class SubsetQueryGenerator:
             )
             return self._maybe_add_order_by(sql, alias_cols)
 
+        return self._build_inner_join_2()
+
+    def _build_rare_behavior_join(self) -> str:
+        if len(self.tables) < 2:
+            return self._build_single()
+
+        builders = [
+            self._build_null_safe_join,
+            self._build_row_constructor_join,
+            self._build_prefix_expression_join,
+            self._build_collate_join,
+            self._build_enum_cross_join,
+            self._build_find_in_set_join,
+            self._build_like_prefix_join,
+            self._build_temporal_cast_join,
+            self._build_strcmp_join,
+            self._build_char_padding_join,
+        ]
+        random.shuffle(builders)
+        for builder in builders:
+            sql = builder()
+            if sql:
+                return sql
         return self._build_inner_join_2()
 
     def _build_inner_join_3(self) -> str:
@@ -339,7 +366,7 @@ class SubsetQueryGenerator:
         candidates = [
             c for c in cols
             if not c.is_primary_key
-            and (c.data_type in ('INT', 'DATE') or self._is_string_like_type(c.data_type))
+            and (c.data_type in _INT_FAMILY or c.data_type in _TEMPORAL_FAMILY or self._is_string_like_type(c.data_type))
         ]
         if not candidates:
             return self._build_single()
@@ -469,6 +496,174 @@ class SubsetQueryGenerator:
         )
         return f"{q1} UNION ALL {q2}"
 
+    def _render_join_sql(self,
+                         t1n: str, t1c: List[Any], t2n: str, t2c: List[Any],
+                         on: str, comment: str) -> str:
+        a1 = self._alias(t1n)
+        a2 = self._alias(t2n)
+        alias_cols = [(a1, t1c), (a2, t2c)]
+        on_sql = on.format(a1=a1, a2=a2)
+        sql = (
+            f"SELECT /*{comment}*/ {self._select_list(alias_cols)} "
+            f"FROM {self._qi(t1n)} {a1} INNER JOIN {self._qi(t2n)} {a2} ON {on_sql}"
+            f"{self._where_clause(alias_cols)}"
+        )
+        return self._maybe_add_order_by(sql, alias_cols)
+
+    def _iter_table_pairs(self) -> List[Tuple[str, List[Any], str, List[Any]]]:
+        pairs: List[Tuple[str, List[Any], str, List[Any]]] = []
+        for i, (t1n, t1c) in enumerate(self.tables):
+            for j, (t2n, t2c) in enumerate(self.tables):
+                if i == j:
+                    continue
+                pairs.append((t1n, t1c, t2n, t2c))
+        random.shuffle(pairs)
+        return pairs
+
+    def _build_null_safe_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            c1 = self._pick_join_col(t1c)
+            c2 = self._pick_compat_col(t2c, c1)
+            if c1 is None or c2 is None:
+                continue
+            on = "{a1}.`" + c1.name + "` <=> {a2}.`" + c2.name + "`"
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_null_safe_join')
+        return None
+
+    def _build_row_constructor_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            pairs: List[Tuple[Any, Any]] = []
+            for c1 in t1c:
+                c2 = self._pick_compat_col(t2c, c1)
+                if c2 is not None:
+                    pairs.append((c1, c2))
+            unique_pairs: List[Tuple[Any, Any]] = []
+            seen = set()
+            for c1, c2 in pairs:
+                key = (c1.name, c2.name)
+                if key not in seen:
+                    seen.add(key)
+                    unique_pairs.append((c1, c2))
+            if len(unique_pairs) < 2:
+                continue
+            left, right = random.sample(unique_pairs, 2)
+            on = (
+                f"({{a1}}.`{left[0].name}`, {{a1}}.`{right[0].name}`) = "
+                f"({{a2}}.`{left[1].name}`, {{a2}}.`{right[1].name}`)"
+            )
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_row_constructor_join')
+        return None
+
+    def _build_prefix_expression_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            lefts = [c for c in t1c if self._is_string_like_type(c.data_type)]
+            rights = [c for c in t2c if self._is_string_like_type(c.data_type)]
+            if not lefts or not rights:
+                continue
+            c1 = random.choice(lefts)
+            c2 = random.choice(rights)
+            width = random.choice([4, 6, 8, 12])
+            on = f"LEFT({{a1}}.`{c1.name}`, {width}) = {{a2}}.`{c2.name}`"
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_prefix_expression_join')
+        return None
+
+    def _build_collate_join(self) -> Optional[str]:
+        collations = ['utf8mb4_bin', 'utf8mb4_general_ci', 'utf8mb4_unicode_ci']
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            lefts = [c for c in t1c if self._is_string_like_type(c.data_type)]
+            rights = [c for c in t2c if self._is_string_like_type(c.data_type)]
+            if not lefts or not rights:
+                continue
+            c1 = random.choice(lefts)
+            c2 = random.choice(rights)
+            coll = random.choice(collations)
+            on = f"{{a1}}.`{c1.name}` COLLATE {coll} = {{a2}}.`{c2.name}`"
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_collate_join')
+        return None
+
+    def _build_enum_cross_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            enums = [c for c in t1c if self._is_enum_col(c)]
+            if not enums:
+                continue
+            enum_col = random.choice(enums)
+            string_targets = [c for c in t2c if self._is_string_like_type(c.data_type)]
+            int_targets = [c for c in t2c if c.data_type in _INT_FAMILY]
+            choices: List[str] = []
+            if string_targets:
+                tgt = random.choice(string_targets)
+                choices.append(f"{{a1}}.`{enum_col.name}` = {{a2}}.`{tgt.name}`")
+            if int_targets:
+                tgt = random.choice(int_targets)
+                choices.append(f"{{a1}}.`{enum_col.name}` + 0 = {{a2}}.`{tgt.name}`")
+            if not choices:
+                continue
+            return self._render_join_sql(t1n, t1c, t2n, t2c, random.choice(choices), 'rare_enum_cross_join')
+        return None
+
+    def _build_find_in_set_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            sets = [c for c in t1c if self._is_set_col(c)]
+            rights = [c for c in t2c if self._is_string_like_type(c.data_type)]
+            if not sets or not rights:
+                continue
+            c1 = random.choice(sets)
+            c2 = random.choice(rights)
+            on = f"FIND_IN_SET({{a2}}.`{c2.name}`, {{a1}}.`{c1.name}`) > 0"
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_find_in_set_join')
+        return None
+
+    def _build_like_prefix_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            lefts = [c for c in t1c if self._is_string_like_type(c.data_type)]
+            rights = [c for c in t2c if self._is_string_like_type(c.data_type)]
+            if not lefts or not rights:
+                continue
+            c1 = random.choice(lefts)
+            c2 = random.choice(rights)
+            on = f"{{a1}}.`{c1.name}` LIKE CONCAT({{a2}}.`{c2.name}`, '%')"
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_like_prefix_join')
+        return None
+
+    def _build_temporal_cast_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            lefts = [c for c in t1c if self._is_timestampish_col(c)]
+            rights = [c for c in t2c if c.data_type == 'DATE']
+            if not lefts or not rights:
+                continue
+            c1 = random.choice(lefts)
+            c2 = random.choice(rights)
+            on = random.choice([
+                f"CAST({{a1}}.`{c1.name}` AS DATE) = {{a2}}.`{c2.name}`",
+                f"DATE({{a1}}.`{c1.name}`) = {{a2}}.`{c2.name}`",
+            ])
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_temporal_cast_join')
+        return None
+
+    def _build_strcmp_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            lefts = [c for c in t1c if self._is_string_like_type(c.data_type)]
+            rights = [c for c in t2c if self._is_string_like_type(c.data_type)]
+            if not lefts or not rights:
+                continue
+            c1 = random.choice(lefts)
+            c2 = random.choice(rights)
+            on = f"STRCMP({{a1}}.`{c1.name}`, {{a2}}.`{c2.name}`) = 0"
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_strcmp_join')
+        return None
+
+    def _build_char_padding_join(self) -> Optional[str]:
+        for t1n, t1c, t2n, t2c in self._iter_table_pairs():
+            chars = [c for c in t1c if self._is_char_col(c)]
+            rights = [c for c in t2c if self._is_string_like_type(c.data_type)]
+            if not chars or not rights:
+                continue
+            c1 = random.choice(chars)
+            c2 = random.choice(rights)
+            on = f"RTRIM({{a1}}.`{c1.name}`) = {{a2}}.`{c2.name}`"
+            return self._render_join_sql(t1n, t1c, t2n, t2c, on, 'rare_char_padding_join')
+        return None
+
     # ──────────────────────────────────────────
     # Projection helpers
     # ──────────────────────────────────────────
@@ -595,7 +790,7 @@ class SubsetQueryGenerator:
             if r < 0.85:
                 return f"{self._fn('UPPER')}({base})"
             return f"{self._fn('CONCAT')}({base}, {empty_str})"
-        if dt == 'DATE':
+        if dt in _TEMPORAL_FAMILY:
             if r < 0.5:
                 return base
             return f"COALESCE({base}, {self._lit('2023-01-01', 'DATE')})"
@@ -653,7 +848,7 @@ class SubsetQueryGenerator:
         r = random.random()
         alias_cols = alias_cols or [(alias, [col])]
 
-        if dt == 'DATE':
+        if dt in _TEMPORAL_FAMILY:
             other = self._pick_compatible_ref(alias_cols, col, alias)
             if other and r < 0.35:
                 op = '=' if self._is_risky_cross_type_pair(col, other[1]) else '>='
@@ -780,6 +975,11 @@ class SubsetQueryGenerator:
             if loose:
                 if random.random() < 0.55:
                     return random.choice(loose)
+        if ref.data_type in _TEMPORAL_FAMILY:
+            loose = [c for c in cols if c.data_type in _TEMPORAL_FAMILY]
+            if loose:
+                if random.random() < 0.55:
+                    return random.choice(loose)
         if self._is_string_like_type(ref.data_type):
             loose = [c for c in cols if self._is_string_like_type(c.data_type)]
             if loose:
@@ -839,7 +1039,7 @@ class SubsetQueryGenerator:
                 return None
             return f"{ref1} = {ref2}"
 
-        if dt in _NUMERIC_FAMILY or dt == 'DATE':
+        if dt in _NUMERIC_FAMILY or dt in _TEMPORAL_FAMILY:
             ops = ['>=', '<='] if prefer_nontrivial else ['=', '>=', '<=']
             if not allow_equality and '=' in ops:
                 ops.remove('=')
@@ -865,6 +1065,8 @@ class SubsetQueryGenerator:
             return False
         if c1.data_type == c2.data_type:
             return True
+        if c1.data_type in _TEMPORAL_FAMILY and c2.data_type in _TEMPORAL_FAMILY:
+            return True
         if self._is_string_like_type(c1.data_type) and self._is_string_like_type(c2.data_type):
             return True
         if self._is_risky_cross_type_pair(c1, c2):
@@ -875,6 +1077,7 @@ class SubsetQueryGenerator:
         return (
             c1.data_type == c2.data_type
             or (c1.data_type in _INT_FAMILY and c2.data_type in _INT_FAMILY)
+            or (c1.data_type in _TEMPORAL_FAMILY and c2.data_type in _TEMPORAL_FAMILY)
             or (self._is_string_like_type(c1.data_type) and self._is_string_like_type(c2.data_type))
             or self._is_risky_cross_type_pair(c1, c2)
         )
@@ -936,7 +1139,7 @@ class SubsetQueryGenerator:
             if r < 0.80:
                 return f"{self._fn('LENGTH')}(COALESCE({ref}, {self._lit('', 'VARCHAR')}))"
             return f"{self._fn('UPPER')}({ref})"
-        if dt == 'DATE':
+        if dt in _TEMPORAL_FAMILY:
             if r < 0.60:
                 return ref
             return f"COALESCE({ref}, {self._lit('2023-01-01', 'DATE')})"
@@ -1022,6 +1225,22 @@ class SubsetQueryGenerator:
     def _is_string_like_type(self, data_type: str) -> bool:
         return data_type in _STRING_FAMILY
 
+    def _declared_type(self, col: Any) -> str:
+        return getattr(col, 'declared_type', col.data_type or '').upper()
+
+    def _is_enum_col(self, col: Any) -> bool:
+        return col.data_type == 'ENUM' or self._declared_type(col).startswith('ENUM')
+
+    def _is_set_col(self, col: Any) -> bool:
+        return col.data_type == 'SET' or self._declared_type(col).startswith('SET(')
+
+    def _is_char_col(self, col: Any) -> bool:
+        return col.data_type == 'CHAR' or self._declared_type(col).startswith('CHAR')
+
+    def _is_timestampish_col(self, col: Any) -> bool:
+        dt = self._declared_type(col)
+        return col.data_type in ('DATETIME', 'TIMESTAMP') or dt.startswith('DATETIME') or dt.startswith('TIMESTAMP')
+
     def _is_risky_cross_type_pair(self, c1: Any, c2: Any) -> bool:
         if c1.data_type == 'OPAQUE' or c2.data_type == 'OPAQUE':
             return False
@@ -1031,8 +1250,8 @@ class SubsetQueryGenerator:
         right_num = c2.data_type in _NUMERIC_FAMILY
         left_str = self._is_string_like_type(c1.data_type)
         right_str = self._is_string_like_type(c2.data_type)
-        left_date = c1.data_type == 'DATE'
-        right_date = c2.data_type == 'DATE'
+        left_date = c1.data_type in _TEMPORAL_FAMILY
+        right_date = c2.data_type in _TEMPORAL_FAMILY
         return (
             (left_date and right_str) or (right_date and left_str)
             or (left_num and right_str) or (right_num and left_str)

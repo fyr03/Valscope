@@ -20,9 +20,9 @@ if __name__ == '__main__':
     
     ##############################################################################
     
-    dialect_str = 'percona'
+    dialect_str = 'mysql'
     use_value_mutator = True
-    run_hours = 12
+    run_hours = 4
     is_use_database_tables=False
     use_subset_oracle   = True   # 是否启用 SubsetOracle
     subset_oracle_rounds = 3     # 每个主循环轮次中，SubsetOracle 运行的次数
@@ -30,7 +30,7 @@ if __name__ == '__main__':
     
     db_config={
                 'host': '127.0.0.1',
-                'port': 3310,
+                'port': 3307,
                 'database': 'test',
                 'user': 'sqlancer',
                 'password': 'sqlancer',

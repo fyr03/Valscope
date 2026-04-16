@@ -56,8 +56,9 @@ _RUNTIME_ERROR_PATTERNS: dict = {
                  'decimal value is out of range', 'division by 0', 'division by zero'),
 }
 
-_STRING_LIKE_TYPES = ('VARCHAR', 'TEXT', 'LONGTEXT')
-_INDEXABLE_TYPES   = ('INT', 'VARCHAR', 'TEXT', 'LONGTEXT', 'DATE')
+_TEMPORAL_TYPES    = ('DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR')
+_STRING_LIKE_TYPES = ('VARCHAR', 'TEXT', 'LONGTEXT', 'CHAR', 'ENUM', 'SET')
+_INDEXABLE_TYPES   = ('INT', 'VARCHAR', 'TEXT', 'LONGTEXT', 'CHAR', 'ENUM', 'SET') + _TEMPORAL_TYPES
 
 
 # ─────────────────────────────────────────────
@@ -67,6 +68,7 @@ _INDEXABLE_TYPES   = ('INT', 'VARCHAR', 'TEXT', 'LONGTEXT', 'DATE')
 class ColDef:
     name: str
     data_type: str       # 'INT' / 'VARCHAR' / 'TEXT' / 'LONGTEXT' / 'DATE' / ...
+    declared_type: str   = ''
     is_primary_key: bool = False
     is_nullable: bool    = True
     varchar_len: int     = 128
@@ -309,9 +311,14 @@ class SubsetOracle:
         cols = []
         for c in vs_table.columns:
             dt = c.data_type.upper()
-            if dt.startswith('VARCHAR') or dt.startswith('CHAR') \
-                    or 'ENUM' in dt or 'SET(' in dt:
+            if dt.startswith('VARCHAR'):
                 base_dt, vlen = 'VARCHAR', 255
+            elif dt.startswith('CHAR'):
+                base_dt, vlen = 'CHAR', 255
+            elif dt.startswith('ENUM'):
+                base_dt, vlen = 'ENUM', 255
+            elif dt.startswith('SET('):
+                base_dt, vlen = 'SET', 255
             elif 'LONGTEXT' in dt or 'MEDIUMTEXT' in dt:
                 base_dt, vlen = 'LONGTEXT', 1024
             elif 'TEXT' in dt:
@@ -322,8 +329,16 @@ class SubsetOracle:
                 base_dt, vlen = 'FLOAT', 128
             elif 'DOUBLE' in dt:
                 base_dt, vlen = 'DOUBLE', 128
-            elif dt in ('DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR'):
+            elif dt.startswith('DATETIME'):
+                base_dt, vlen = 'DATETIME', 32
+            elif dt.startswith('TIMESTAMP'):
+                base_dt, vlen = 'TIMESTAMP', 32
+            elif dt == 'DATE':
                 base_dt, vlen = 'DATE', 32
+            elif dt.startswith('TIME'):
+                base_dt, vlen = 'TIME', 32
+            elif dt == 'YEAR':
+                base_dt, vlen = 'YEAR', 32
             elif 'BLOB' in dt or 'BINARY' in dt or 'BIT' in dt \
                     or 'JSON' in dt or 'GEOMETRY' in dt or 'POINT' in dt \
                     or 'POLYGON' in dt or 'LINESTRING' in dt:
@@ -334,6 +349,7 @@ class SubsetOracle:
             cols.append(ColDef(
                 name=c.name,
                 data_type=base_dt,
+                declared_type=c.data_type,
                 is_primary_key=(c.name == vs_table.primary_key),
                 is_nullable=c.is_nullable,
                 varchar_len=vlen,
@@ -391,7 +407,7 @@ class SubsetOracle:
         for _ in range(MAX_QUERY_GEN_ATTEMPTS):
             risky_count = sum(
                 1 for s in results
-                if 'implicit_conversion_' in s.lower()
+                if 'implicit_conversion_' in s.lower() or 'rare_' in s.lower()
             )
             if len(results) >= TARGET_BASELINE_QUERIES and risky_count >= min_risky_queries:
                 break
@@ -461,7 +477,7 @@ class SubsetOracle:
     # ──────────────────────────────────────────
     def _choose_predicate_col(self, cols: List[ColDef]) -> ColDef:
         preferred = [c for c in cols if not c.is_primary_key
-                     and c.data_type in ('DATE', 'VARCHAR', 'TEXT', 'LONGTEXT')]
+                     and c.data_type in _TEMPORAL_TYPES + _STRING_LIKE_TYPES]
         if preferred and random.random() < 0.75:
             return random.choice(preferred)
         preferred = [c for c in cols if not c.is_primary_key
@@ -538,17 +554,86 @@ class SubsetOracle:
             hot_values_by_col=hot_by_col,
         )
 
+    def _declared_choices(self, col: ColDef) -> List[str]:
+        return re.findall(r"'((?:''|[^'])*)'", col.declared_type or '')
+
+    def _temporal_literal(self, dt: str, future: bool = False) -> str:
+        if dt == 'DATE':
+            year = random.randint(2030, 2039) if future else random.randint(1990, 2038)
+            return f"'{year}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}'"
+        if dt in ('DATETIME', 'TIMESTAMP'):
+            year = random.randint(2030, 2039) if future else random.randint(1990, 2038)
+            sec = random.randint(0, 59)
+            micros = f".{random.randint(0, 999999):06d}" if random.random() < 0.5 else ''
+            return (
+                f"'{year}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d} "
+                f"{random.randint(0, 23):02d}:{random.randint(0, 59):02d}:{sec:02d}{micros}'"
+            )
+        if dt == 'TIME':
+            return f"'{random.randint(0, 23):02d}:{random.randint(0, 59):02d}:{random.randint(0, 59):02d}'"
+        if dt == 'YEAR':
+            return str(random.randint(2030, 2039) if future else random.randint(1990, 2038))
+        return 'NULL'
+
+    def _string_literal(self, col: ColDef, allow_trailing_spaces: bool = True) -> str:
+        if col.data_type == 'ENUM':
+            choices = self._declared_choices(col)
+            if choices:
+                return f"'{random.choice(choices)}'"
+        if col.data_type == 'SET':
+            choices = self._declared_choices(col)
+            if choices:
+                sample = random.sample(choices, k=random.randint(1, len(choices)))
+                return "'" + ",".join(sample) + "'"
+        if random.random() < 0.45:
+            literal = random.choice([
+                "'0'", "'1'", "'-1'", "'0000-00-00'",
+                "'2023-01-01'", "'2023-01-01 00:00:00'",
+                "'not-a-date'", "'01e0'", "' 1'", "''",
+            ])
+        else:
+            n = random.randint(8, 64 if col.data_type == 'LONGTEXT' else 20)
+            token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789_-:/ ', k=n)).rstrip()
+            literal = f"'{token or 'seed'}'"
+        if allow_trailing_spaces and col.data_type == 'CHAR' and literal.startswith("'") and literal.endswith("'"):
+            return literal[:-1] + '   ' + "'"
+        return literal
+
     def _create_hot_values(self, col: ColDef) -> List[str]:
         dt = col.data_type
-        if dt == 'DATE':
-            return ["'not-a-date'", "'2023-01-01'", "'0000-00-00'"]
+        if dt in _TEMPORAL_TYPES:
+            if dt == 'DATE':
+                return ["'not-a-date'", "'2023-01-01'", "'0000-00-00'"]
+            if dt in ('DATETIME', 'TIMESTAMP'):
+                return ["'2023-01-01 00:00:00'", "'2023-01-01 00:00:00.123456'", "'not-a-date'"]
+            if dt == 'TIME':
+                return ["'00:00:00'", "'23:59:59'", "'not-a-time'"]
+            if dt == 'YEAR':
+                return ['1999', '2023', 'NULL']
         if dt == 'INT':
             a = random.randint(-16, 16)
             return [str(a), str(a+1+random.randint(0,3)), str(a-1-random.randint(0,3))]
         if dt in _STRING_LIKE_TYPES:
+            if dt == 'ENUM':
+                choices = self._declared_choices(col)
+                if choices:
+                    base = choices[:3] if len(choices) >= 3 else (choices + choices[:1] + choices[:1])[:3]
+                    return [f"'{base[0]}'", f"'{base[1]}'", f"'{base[2]}'"]
+            if dt == 'SET':
+                choices = self._declared_choices(col)
+                if choices:
+                    first = choices[:2] if len(choices) >= 2 else choices
+                    second = choices[-2:] if len(choices) >= 2 else choices
+                    return [
+                        "'" + ",".join(first[:1]) + "'",
+                        "'" + ",".join(first) + "'",
+                        "'" + ",".join(second) + "'",
+                    ]
             s = f"hv_{random.randint(100,9999)}"
             if dt == 'LONGTEXT':
                 return [f"'{s}'", "'not-a-date'", "'2023-01-01 00:00:00'"]
+            if dt == 'CHAR':
+                return [f"'{s}   '", "'pad_me   '", "'2023-01-01   '"]
             return [f"'{s}'", "'not-a-date'", "'2023-01-01'"]
         if dt in ('FLOAT', 'DOUBLE'):
             a = random.randint(-200, 200) / 10.0
@@ -567,17 +652,13 @@ class SubsetOracle:
                 c = str(base + 20 + i)
                 if c not in existing: return c
             return str(base + 40)
-        if dt == 'DATE':
-            return f"'{2030 + random.randint(0, 9)}-12-{random.randint(10, 28):02d}'"
+        if dt in _TEMPORAL_TYPES:
+            return self._temporal_literal(dt, future=True)
         if dt in _STRING_LIKE_TYPES:
-            for i in range(16):
-                if i % 3 == 0:
-                    c = f"'{2030 + i}-01-{random.randint(10, 28):02d}'"
-                elif i % 3 == 1:
-                    c = f"'exp_{random.randint(1000,9999)}_{i}'"
-                else:
-                    c = f"'{random.randint(1000, 9999)}'"
-                if c not in existing: return c
+            for _ in range(16):
+                c = self._string_literal(col)
+                if c not in existing:
+                    return c
             return f"'exp_final_{len(existing)}'"
         if dt in ('FLOAT', 'DOUBLE'):
             nums = [float(v) for v in existing if v != 'NULL']
@@ -620,11 +701,15 @@ class SubsetOracle:
             dt = c.data_type
             if dt == 'INT':
                 boundary_map[c.name] = ['0','1','-1','2147483647','-2147483648','NULL']
-            elif dt == 'DATE':
+            elif dt in ('DATE', 'DATETIME', 'TIMESTAMP'):
                 boundary_map[c.name] = [
                     "'0000-00-00'", "'1000-01-01'", "'9999-12-31'",
-                    "'not-a-date'", "''", "'2023-02-29'", 'NULL'
+                    "'not-a-date'", "''", "'2023-02-29'", "'2023-01-01 00:00:00.999999'", 'NULL'
                 ]
+            elif dt == 'TIME':
+                boundary_map[c.name] = ["'00:00:00'", "'23:59:59'", "'25:61:61'", "''", 'NULL']
+            elif dt == 'YEAR':
+                boundary_map[c.name] = ['1901', '1970', '2038', '2155', 'NULL']
             elif dt in _STRING_LIKE_TYPES:
                 boundary_map[c.name] = [
                     "''", "'NULL'", "'0'", "'1'", "'0000-00-00'",
@@ -663,23 +748,19 @@ class SubsetOracle:
                 return exp_hot
             return random.choice(hot_vals)
         if dt == 'INT':    return str(random.randint(-1000, 1000))
-        if dt == 'DATE':
-            return random.choice([
-                f"'{random.randint(1990, 2038)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}'",
-                "'not-a-date'",
-                "'0000-00-00'",
-                "''",
-            ])
+        if dt in _TEMPORAL_TYPES:
+            if random.random() < 0.35:
+                if dt == 'DATE':
+                    return random.choice(["'not-a-date'", "'0000-00-00'", "''"])
+                if dt in ('DATETIME', 'TIMESTAMP'):
+                    return random.choice(["'not-a-date'", "'0000-00-00 00:00:00'", "''"])
+                if dt == 'TIME':
+                    return random.choice(["'not-a-time'", "'25:61:61'", "''"])
+                if dt == 'YEAR':
+                    return random.choice(['0000', '1901', '2155'])
+            return self._temporal_literal(dt)
         if dt in _STRING_LIKE_TYPES:
-            if random.random() < 0.45:
-                return random.choice([
-                    "'0'", "'1'", "'-1'", "'0000-00-00'",
-                    "'2023-01-01'", "'2023-01-01 00:00:00'",
-                    "'not-a-date'", "'01e0'", "' 1'", "''",
-                ])
-            n = random.randint(8, 64 if dt == 'LONGTEXT' else 20)
-            token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789_-:/ ', k=n)).rstrip()
-            return f"'{token or 'seed'}'"
+            return self._string_literal(col)
         if dt in ('FLOAT','DOUBLE'): return f"{random.uniform(-1000, 1000):.3f}"
         if dt == 'DECIMAL':          return f"{random.uniform(-1000, 1000):.2f}"
         return 'NULL'
@@ -694,16 +775,10 @@ class SubsetOracle:
                 dt = c.data_type
                 if dt == 'INT':
                     vals.append(random.choice(['0', '1', '-1', '20230101']))
-                elif dt == 'DATE':
-                    vals.append(random.choice([
-                        "'not-a-date'", "'2023-01-01'", "'0000-00-00'", "'1999-12-31'", 'NULL'
-                    ]))
+                elif dt in _TEMPORAL_TYPES:
+                    vals.append(self._temporal_literal(dt) if random.random() < 0.6 else 'NULL')
                 elif dt in _STRING_LIKE_TYPES:
-                    vals.append(random.choice([
-                        "'0'", "'1'", "'-1'", "'0000-00-00'",
-                        "'2023-01-01'", "'2023-01-01 00:00:00'",
-                        "'not-a-date'", "'sample_text'", "''"
-                    ]))
+                    vals.append(self._string_literal(c))
                 elif dt in ('FLOAT', 'DOUBLE'):
                     vals.append(random.choice(['0.0', '1.0', '-1.0']))
                 elif dt == 'DECIMAL':
