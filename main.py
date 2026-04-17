@@ -22,7 +22,7 @@ if __name__ == '__main__':
     
     dialect_str = 'mysql'
     use_value_mutator = True
-    run_hours = 4
+    run_hours = 12
     is_use_database_tables=False
     use_subset_oracle   = True   # 是否启用 SubsetOracle
     subset_oracle_rounds = 3     # 每个主循环轮次中，SubsetOracle 运行的次数

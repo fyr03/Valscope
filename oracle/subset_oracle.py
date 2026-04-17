@@ -22,7 +22,7 @@ import uuid
 import pymysql
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 from datetime import datetime
 from oracle.subset_query_gen import SubsetQueryGenerator
 from data_structures.db_dialect import get_current_dialect, set_current_dialect
@@ -72,6 +72,7 @@ class ColDef:
     is_primary_key: bool = False
     is_nullable: bool    = True
     varchar_len: int     = 128
+    is_indexed: bool     = False
 
 
 @dataclass
@@ -107,11 +108,15 @@ class IgnorableQueryRuntimeError(Exception):
 class SubsetOracle:
 
     def __init__(self, db_config: dict, verbose: bool = True,
-                 log_sql: bool = False, log_file: str = None):
+                 log_sql: bool = False, log_file: str = None,
+                 enable_known_mysql_date_index_string_eq_workaround: Optional[bool] = None):
         self.db_config = db_config
         self.verbose   = verbose
         self.log_sql   = log_sql
         self.log_file  = log_file
+        self.enable_known_mysql_date_index_string_eq_workaround = (
+            enable_known_mysql_date_index_string_eq_workaround
+        )
         self._log_dir  = None
         self._sql_log  = []
 
@@ -135,6 +140,12 @@ class SubsetOracle:
         family = self._dialect.optimizer_family()   # 'mysql' / 'mariadb' / 'percona'
         self._ignorable_codes    = _RUNTIME_ERROR_CODES.get(family,    _RUNTIME_ERROR_CODES['mysql'])
         self._ignorable_patterns = _RUNTIME_ERROR_PATTERNS.get(family, _RUNTIME_ERROR_PATTERNS['mysql'])
+        if self.enable_known_mysql_date_index_string_eq_workaround is None:
+            self._enable_known_mysql_date_index_string_eq_workaround = (family == 'mysql')
+        else:
+            self._enable_known_mysql_date_index_string_eq_workaround = (
+                self.enable_known_mysql_date_index_string_eq_workaround
+            )
 
         round_stats = {
             'round_id': uid, 'queries': 0,
@@ -148,6 +159,10 @@ class SubsetOracle:
         self._log(f"\n{'='*60}")
         self._log(f" SUBSET ORACLE round #{uid}")
         self._log(f"{'='*60}")
+        self._log(
+            " Known MySQL DATE-index/string-eq workaround: "
+            f"{'ON' if self._enable_known_mysql_date_index_string_eq_workaround else 'OFF'}"
+        )
 
         conn = self._connect()
         if conn is None:
@@ -170,7 +185,9 @@ class SubsetOracle:
 
             # ── Step 1.5：谓词列、索引、偏斜配置 ─────────────
             pred_col = self._choose_predicate_col(main_cols)
-            self._ensure_indexes(conn, main_name, main_cols, pred_col, uid)
+            indexed_cols = self._ensure_indexes(conn, main_name, main_cols, pred_col, uid)
+            for c in main_cols:
+                c.is_indexed = c.name in indexed_cols
             skew = self._create_skew_profile(main_cols, pred_col)
             self._log(f"  Main table: {main_name}, predicate col: {pred_col.name}, "
                       f"primary_hot={skew.primary_hot}")
@@ -194,7 +211,8 @@ class SubsetOracle:
             # ── Step 3：生成查询并收集 S1 快照 ───────────────
             self._log(f"\n[Step 3] Building baseline queries on S1 ...")
             baselines = self._build_baselines(
-                conn, vs_tables, name_map, main_name, main_cols, numeric_cols, skew)
+                conn, vs_tables, name_map, main_name, main_cols, numeric_cols, skew,
+                indexed_cols_by_table={main_name: indexed_cols})
             self._log(f"  Validated baselines: {len(baselines)}")
             if len(baselines) < MIN_BASELINE_QUERIES:
                 self._log("  [SKIP] Not enough valid baseline queries.")
@@ -222,7 +240,7 @@ class SubsetOracle:
             # ── Step 5+6：验证单调性 ──────────────────────────
             self._log(f"\n[Step 5+6] Verifying monotonicity on S2 ...")
             for i, (spec, s1_snap) in enumerate(baselines):
-                s2_plan      = self._capture_explain(conn, spec.select_sql)
+                s2_plan      = self._capture_explain_traditional(conn, spec.select_sql)
                 plan_changed = not self._plans_equivalent(s1_snap.explain_plan, s2_plan)
                 self._log(f"  Query[{i+1}] plan_changed={plan_changed}")
                 self._log(f"  Query[{i+1}] SQL: {spec.select_sql}")
@@ -307,7 +325,8 @@ class SubsetOracle:
         result  = '\n'.join(cleaned)
         return re.sub(r',\s*\n(\s*\))', r'\n\1', result)
 
-    def _vs_table_to_coldefs(self, vs_table) -> List[ColDef]:
+    def _vs_table_to_coldefs(self, vs_table, indexed_col_names: Optional[Set[str]] = None) -> List[ColDef]:
+        indexed_col_names = indexed_col_names or set()
         cols = []
         for c in vs_table.columns:
             dt = c.data_type.upper()
@@ -353,6 +372,7 @@ class SubsetOracle:
                 is_primary_key=(c.name == vs_table.primary_key),
                 is_nullable=c.is_nullable,
                 varchar_len=vlen,
+                is_indexed=(c.name in indexed_col_names),
             ))
         return cols
 
@@ -390,15 +410,26 @@ class SubsetOracle:
     def _build_baselines(self, conn, vs_tables, name_map: dict,
                           main_name: str, main_cols: List[ColDef],
                           numeric_cols: List[ColDef],
-                          skew: SkewProfile) -> List[Tuple[QuerySpec, QuerySnapshot]]:
+                          skew: SkewProfile,
+                          indexed_cols_by_table: Optional[Dict[str, Set[str]]] = None) -> List[Tuple[QuerySpec, QuerySnapshot]]:
+        indexed_cols_by_table = indexed_cols_by_table or {}
         tables = [
-            (name_map[tbl.name], self._vs_table_to_coldefs(tbl))
+            (
+                name_map[tbl.name],
+                self._vs_table_to_coldefs(
+                    tbl,
+                    indexed_col_names=indexed_cols_by_table.get(name_map[tbl.name], set()),
+                ),
+            )
             for tbl in vs_tables
         ]
         gen = SubsetQueryGenerator(
             tables=tables,
             skew_hot_values={name_map[vs_tables[0].name]: skew.hot_values_by_col},
             dialect=self._dialect,
+            enable_known_mysql_date_index_string_eq_workaround=(
+                self._enable_known_mysql_date_index_string_eq_workaround
+            ),
         )
 
         results: Dict[str, Tuple[QuerySpec, QuerySnapshot]] = {}
@@ -452,7 +483,7 @@ class SubsetOracle:
             if snap.count <= 10000:
                 snap.row_digests = self._capture_row_digests(conn, sql)
 
-            snap.explain_plan = self._capture_explain(conn, sql)
+            snap.explain_plan = self._capture_explain_traditional(conn, sql)
         except IgnorableQueryRuntimeError as e:
             self._log(f"  snapshot skipped: {e}")
             return None
@@ -488,10 +519,12 @@ class SubsetOracle:
         return random.choice(non_pk) if non_pk else cols[0]
 
     def _ensure_indexes(self, conn, table_name: str, cols: List[ColDef],
-                        pred_col: ColDef, uid: str):
+                        pred_col: ColDef, uid: str) -> Set[str]:
+        indexed_cols: Set[str] = set()
         pred_idx_col = self._index_expr(pred_col)
         self._exec_ddl(conn, f"CREATE INDEX i_s3_{uid} ON {table_name} ({pred_idx_col})",
                        ignore_error=True)
+        indexed_cols.add(pred_col.name)
 
         candidates = [
             c for c in cols
@@ -508,6 +541,7 @@ class SubsetOracle:
                     f"CREATE INDEX i_s3_{uid}_{c.name} ON {table_name} ({self._index_expr(c)})",
                     ignore_error=True,
                 )
+                indexed_cols.add(c.name)
 
         comp_candidates = [
             c for c in cols
@@ -524,6 +558,8 @@ class SubsetOracle:
                     f"({self._index_expr(pred_col)}, {self._index_expr(c2)})",
                     ignore_error=True,
                 )
+                indexed_cols.add(pred_col.name)
+                indexed_cols.add(c2.name)
         elif len(comp_candidates) >= 2 and random.random() < 0.4:
             c1, c2 = random.sample(comp_candidates, k=2)
             self._exec_ddl(
@@ -532,6 +568,9 @@ class SubsetOracle:
                 f"({self._index_expr(c1)}, {self._index_expr(c2)})",
                 ignore_error=True,
             )
+            indexed_cols.add(c1.name)
+            indexed_cols.add(c2.name)
+        return indexed_cols
 
     def _index_expr(self, col: ColDef) -> str:
         if col.data_type in _STRING_LIKE_TYPES:
@@ -838,8 +877,9 @@ class SubsetOracle:
 
     def _verify_max(self, spec, col, s1, s2):
         v1, v2 = s1.max_values.get(col), s2.max_values.get(col)
-        if v1 is None: return
-        if v2 is None or v1 > v2 + FLOAT_TOLERANCE:
+        if v1 is None or v2 is None:
+            return
+        if v1 > v2 + FLOAT_TOLERANCE:
             raise AssertionError(
                 f"MAX({col}) violation: S1={v1} > S2={v2}\n"
                 f"  Query: {spec.select_sql}\n"
@@ -849,8 +889,9 @@ class SubsetOracle:
 
     def _verify_min(self, spec, col, s1, s2):
         v1, v2 = s1.min_values.get(col), s2.min_values.get(col)
-        if v1 is None: return
-        if v2 is None or v2 > v1 + FLOAT_TOLERANCE:
+        if v1 is None or v2 is None:
+            return
+        if v2 > v1 + FLOAT_TOLERANCE:
             raise AssertionError(
                 f"MIN({col}) violation: S2_min={v2} > S1_min={v1} "
                 f"(expected S2_min <= S1_min)\n"
@@ -914,6 +955,39 @@ class SubsetOracle:
                     )
         except Exception as e:
             self._log(f"  EXPLAIN failed: {e}")
+        return rows
+
+    def _capture_explain_traditional(self, conn, select_sql: str) -> List[str]:
+        rows = []
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"EXPLAIN FORMAT=TRADITIONAL {select_sql}")
+                if not cur.description:
+                    return rows
+                col_names = [d[0].lower() for d in cur.description]
+
+                def gcol(row, name):
+                    try:
+                        v = row[col_names.index(name)]
+                        return str(v) if v is not None else 'null'
+                    except (ValueError, IndexError):
+                        return 'null'
+
+                for row in cur.fetchall():
+                    rows.append(
+                        f"id={gcol(row,'id')};"
+                        f"select_type={gcol(row,'select_type')};"
+                        f"table={gcol(row,'table')};"
+                        f"type={gcol(row,'type')};"
+                        f"possible_keys={gcol(row,'possible_keys')};"
+                        f"key={gcol(row,'key')};"
+                        f"key_len={gcol(row,'key_len')};"
+                        f"rows={gcol(row,'rows')};"
+                        f"filtered={gcol(row,'filtered')};"
+                        f"extra={gcol(row,'extra')}"
+                    )
+        except Exception as e:
+            self._log(f"  EXPLAIN FORMAT=TRADITIONAL failed: {e}")
         return rows
 
     def _plans_equivalent(self, p1: List[str], p2: List[str]) -> bool:

@@ -47,6 +47,7 @@ class SubsetQueryGenerator:
         tables: List[Tuple[str, List[Any]]],
         skew_hot_values: Optional[Dict[str, Dict[str, List[str]]]] = None,
         dialect=None,
+        enable_known_mysql_date_index_string_eq_workaround: Optional[bool] = None,
     ) -> None:
         if not tables:
             raise ValueError("SubsetQueryGenerator: at least one table is required")
@@ -54,6 +55,11 @@ class SubsetQueryGenerator:
         self.hot_values = skew_hot_values or {}
         self._ctr = 0
         self._dialect = dialect or get_current_dialect()
+        self._enable_known_mysql_date_index_string_eq_workaround = (
+            enable_known_mysql_date_index_string_eq_workaround
+            if enable_known_mysql_date_index_string_eq_workaround is not None
+            else self._dialect.optimizer_family() == 'mysql'
+        )
         # Per-dialect filtered function pools (e.g. MariaDB excludes LOG/EXP/SIN/COS/TAN)
         self._num_funs = [f for f in _NUM_SCALAR_FUNS if self._dialect.supports_function(f)]
         self._str_funs = [f for f in _STR_SCALAR_FUNS if self._dialect.supports_function(f)]
@@ -180,13 +186,24 @@ class SubsetQueryGenerator:
         t1n, t1c = self.tables[0]
         other = [t for t in self.tables if t[0] != t1n]
         random.shuffle(other)
+        suppressed_known_pair = False
 
         for t2n, t2c in other:
-            pair = self._pick_risky_join_pair(t1c, t2c)
-            if not pair:
+            pair = self._pick_risky_join_pair(
+                t1c, t2c, allow_known_date_index_string_eq=False)
+            if pair is None:
+                if any(
+                    self._is_known_date_index_string_eq(c1, c2)
+                    for c1 in t1c for c2 in t2c
+                ):
+                    suppressed_known_pair = True
                 continue
 
             c1, c2 = pair
+            if self._is_known_date_index_string_eq(c1, c2):
+                suppressed_known_pair = True
+                continue
+
             a1 = self._alias(t1n)
             a2 = self._alias(t2n)
             alias_cols = [(a1, t1c), (a2, t2c)]
@@ -198,8 +215,9 @@ class SubsetQueryGenerator:
             )
             return self._maybe_add_order_by(sql, alias_cols)
 
+        if suppressed_known_pair:
+            return self._build_inner_join_2()
         return self._build_inner_join_2()
-
     def _build_rare_behavior_join(self) -> str:
         if len(self.tables) < 2:
             return self._build_single()
@@ -373,7 +391,11 @@ class SubsetQueryGenerator:
         main_col = random.choice(candidates)
 
         st_name, st_cols = random.choice(self.tables)
-        compat = [c for c in st_cols if self._same_comparable_type(main_col, c)]
+        compat = [
+            c for c in st_cols
+            if self._same_comparable_type(
+                main_col, c, allow_known_date_index_string_eq=False)
+        ]
         if not compat:
             return self._build_single()
         sub_col = random.choice(compat)
@@ -400,7 +422,8 @@ class SubsetQueryGenerator:
         sq_a = self._alias('ex')
 
         jc_main = self._pick_join_col(cols)
-        jc_sub = self._pick_compat_col(st_cols, jc_main)
+        jc_sub = self._pick_compat_col(
+            st_cols, jc_main, allow_known_date_index_string_eq=False)
         if jc_main is None or jc_sub is None:
             return self._build_single()
 
@@ -523,7 +546,8 @@ class SubsetQueryGenerator:
     def _build_null_safe_join(self) -> Optional[str]:
         for t1n, t1c, t2n, t2c in self._iter_table_pairs():
             c1 = self._pick_join_col(t1c)
-            c2 = self._pick_compat_col(t2c, c1)
+            c2 = self._pick_compat_col(
+                t2c, c1, allow_known_date_index_string_eq=False)
             if c1 is None or c2 is None:
                 continue
             on = "{a1}.`" + c1.name + "` <=> {a2}.`" + c2.name + "`"
@@ -534,7 +558,8 @@ class SubsetQueryGenerator:
         for t1n, t1c, t2n, t2c in self._iter_table_pairs():
             pairs: List[Tuple[Any, Any]] = []
             for c1 in t1c:
-                c2 = self._pick_compat_col(t2c, c1)
+                c2 = self._pick_compat_col(
+                    t2c, c1, allow_known_date_index_string_eq=False)
                 if c2 is not None:
                     pairs.append((c1, c2))
             unique_pairs: List[Tuple[Any, Any]] = []
@@ -850,7 +875,7 @@ class SubsetQueryGenerator:
 
         if dt in _TEMPORAL_FAMILY:
             other = self._pick_compatible_ref(alias_cols, col, alias)
-            if other and r < 0.35:
+            if other and r < 0.35 and not self._is_known_date_index_string_eq(col, other[1]):
                 op = '=' if self._is_risky_cross_type_pair(col, other[1]) else '>='
                 return f"{ref} {op} {self._qref(other[0], other[1].name)}"
             return f"{ref} IS NOT NULL" if r < 0.65 else f"{ref} IS NULL"
@@ -898,7 +923,7 @@ class SubsetQueryGenerator:
                 return f"{ref} LIKE '{prefix}%'"
             if r < 0.46:
                 return f"{ref} >= {v}"
-            if r < 0.58 and other:
+            if r < 0.58 and other and not self._is_known_date_index_string_eq(col, other[1]):
                 return f"{ref} = {self._qref(other[0], other[1].name)}"
             if r < 0.70:
                 return f"{self._fn('LENGTH')}(COALESCE({ref}, {empty_str})) >= {random.randint(0, 8)}"
@@ -945,7 +970,8 @@ class SubsetQueryGenerator:
 
     def _join_on(self, a1: str, cols1: List[Any], a2: str, cols2: List[Any]) -> Optional[str]:
         c1 = self._pick_join_col(cols1)
-        c2 = self._pick_compat_col(cols2, c1)
+        c2 = self._pick_compat_col(
+            cols2, c1, allow_known_date_index_string_eq=False)
         if c1 is None or c2 is None:
             return None
 
@@ -963,7 +989,10 @@ class SubsetQueryGenerator:
         safe = [c for c in cols if c.data_type not in _NO_JOIN_TYPES]
         return random.choice(safe) if safe else None
 
-    def _pick_compat_col(self, cols: List[Any], ref: Optional[Any]) -> Optional[Any]:
+    def _pick_compat_col(self,
+                         cols: List[Any],
+                         ref: Optional[Any],
+                         allow_known_date_index_string_eq: bool = True) -> Optional[Any]:
         if ref is None:
             return None
         exact = [c for c in cols if c.data_type == ref.data_type]
@@ -985,16 +1014,37 @@ class SubsetQueryGenerator:
             if loose:
                 if random.random() < 0.55:
                     return random.choice(loose)
-        risky = [c for c in cols if self._is_risky_cross_type_pair(ref, c)]
+        risky = [
+            c for c in cols
+            if self._is_risky_cross_type_pair(ref, c)
+            and (
+                allow_known_date_index_string_eq
+                or not self._is_known_date_index_string_eq(ref, c)
+            )
+        ]
         if risky and random.random() < 0.75:
             return random.choice(risky)
-        compat = [c for c in cols if self._pairwise_type_compatible(ref, c)]
+        compat = [
+            c for c in cols
+            if self._pairwise_type_compatible(ref, c)
+            and (
+                allow_known_date_index_string_eq
+                or not self._is_known_date_index_string_eq(ref, c)
+            )
+        ]
         return random.choice(compat) if compat else None
 
-    def _pick_risky_join_pair(self, cols1: List[Any], cols2: List[Any]) -> Optional[Tuple[Any, Any]]:
+    def _pick_risky_join_pair(self,
+                              cols1: List[Any],
+                              cols2: List[Any],
+                              allow_known_date_index_string_eq: bool = True) -> Optional[Tuple[Any, Any]]:
         pairs = [
             (c1, c2) for c1 in cols1 for c2 in cols2
             if self._is_risky_cross_type_pair(c1, c2)
+            and (
+                allow_known_date_index_string_eq
+                or not self._is_known_date_index_string_eq(c1, c2)
+            )
         ]
         return random.choice(pairs) if pairs else None
 
@@ -1034,6 +1084,9 @@ class SubsetQueryGenerator:
         ref2 = self._qref(a2, c2.name)
         dt = c1.data_type
 
+        if self._is_known_date_index_string_eq(c1, c2):
+            return None
+
         if self._is_risky_cross_type_pair(c1, c2):
             if not allow_equality:
                 return None
@@ -1069,17 +1122,28 @@ class SubsetQueryGenerator:
             return True
         if self._is_string_like_type(c1.data_type) and self._is_string_like_type(c2.data_type):
             return True
+        if self._is_known_date_index_string_eq(c1, c2):
+            return False
         if self._is_risky_cross_type_pair(c1, c2):
             return True
         return c1.data_type in _NUMERIC_FAMILY and c2.data_type in _NUMERIC_FAMILY
 
-    def _same_comparable_type(self, c1: Any, c2: Any) -> bool:
+    def _same_comparable_type(self,
+                              c1: Any,
+                              c2: Any,
+                              allow_known_date_index_string_eq: bool = True) -> bool:
         return (
             c1.data_type == c2.data_type
             or (c1.data_type in _INT_FAMILY and c2.data_type in _INT_FAMILY)
             or (c1.data_type in _TEMPORAL_FAMILY and c2.data_type in _TEMPORAL_FAMILY)
             or (self._is_string_like_type(c1.data_type) and self._is_string_like_type(c2.data_type))
-            or self._is_risky_cross_type_pair(c1, c2)
+            or (
+                self._is_risky_cross_type_pair(c1, c2)
+                and (
+                    allow_known_date_index_string_eq
+                    or not self._is_known_date_index_string_eq(c1, c2)
+                )
+            )
         )
 
     def _pick_compatible_ref(self,
@@ -1240,6 +1304,15 @@ class SubsetQueryGenerator:
     def _is_timestampish_col(self, col: Any) -> bool:
         dt = self._declared_type(col)
         return col.data_type in ('DATETIME', 'TIMESTAMP') or dt.startswith('DATETIME') or dt.startswith('TIMESTAMP')
+
+    def _is_known_date_index_string_eq(self, c1: Any, c2: Any) -> bool:
+        if not self._enable_known_mysql_date_index_string_eq_workaround:
+            return False
+        left_date = c1.data_type == 'DATE' and getattr(c1, 'is_indexed', False)
+        right_date = c2.data_type == 'DATE' and getattr(c2, 'is_indexed', False)
+        left_str = self._is_string_like_type(c1.data_type)
+        right_str = self._is_string_like_type(c2.data_type)
+        return (left_date and right_str) or (right_date and left_str)
 
     def _is_risky_cross_type_pair(self, c1: Any, c2: Any) -> bool:
         if c1.data_type == 'OPAQUE' or c2.data_type == 'OPAQUE':
