@@ -190,7 +190,11 @@ class SubsetQueryGenerator:
 
         for t2n, t2c in other:
             pair = self._pick_risky_join_pair(
-                t1c, t2c, allow_known_date_index_string_eq=False)
+                t1c,
+                t2c,
+                allow_known_date_index_string_eq=False,
+                allow_mysql_date_string_equality=False,
+            )
             if pair is None:
                 if any(
                     self._is_known_date_index_string_eq(c1, c2)
@@ -394,7 +398,11 @@ class SubsetQueryGenerator:
         compat = [
             c for c in st_cols
             if self._same_comparable_type(
-                main_col, c, allow_known_date_index_string_eq=False)
+                main_col,
+                c,
+                allow_known_date_index_string_eq=False,
+                allow_mysql_date_string_equality=False,
+            )
         ]
         if not compat:
             return self._build_single()
@@ -423,7 +431,11 @@ class SubsetQueryGenerator:
 
         jc_main = self._pick_join_col(cols)
         jc_sub = self._pick_compat_col(
-            st_cols, jc_main, allow_known_date_index_string_eq=False)
+            st_cols,
+            jc_main,
+            allow_known_date_index_string_eq=False,
+            allow_mysql_date_string_equality=False,
+        )
         if jc_main is None or jc_sub is None:
             return self._build_single()
 
@@ -547,7 +559,11 @@ class SubsetQueryGenerator:
         for t1n, t1c, t2n, t2c in self._iter_table_pairs():
             c1 = self._pick_join_col(t1c)
             c2 = self._pick_compat_col(
-                t2c, c1, allow_known_date_index_string_eq=False)
+                t2c,
+                c1,
+                allow_known_date_index_string_eq=False,
+                allow_mysql_date_string_equality=False,
+            )
             if c1 is None or c2 is None:
                 continue
             on = "{a1}.`" + c1.name + "` <=> {a2}.`" + c2.name + "`"
@@ -559,7 +575,11 @@ class SubsetQueryGenerator:
             pairs: List[Tuple[Any, Any]] = []
             for c1 in t1c:
                 c2 = self._pick_compat_col(
-                    t2c, c1, allow_known_date_index_string_eq=False)
+                    t2c,
+                    c1,
+                    allow_known_date_index_string_eq=False,
+                    allow_mysql_date_string_equality=False,
+                )
                 if c2 is not None:
                     pairs.append((c1, c2))
             unique_pairs: List[Tuple[Any, Any]] = []
@@ -847,6 +867,8 @@ class SubsetQueryGenerator:
                 a, c = random.choice(refs)
                 pred = self._predicate(a, c, alias_cols)
             if pred and pred not in preds:
+                if self._would_form_known_mysql_null_contradiction(preds, pred):
+                    continue
                 preds.append(pred)
 
         if not preds:
@@ -875,7 +897,7 @@ class SubsetQueryGenerator:
 
         if dt in _TEMPORAL_FAMILY:
             other = self._pick_compatible_ref(alias_cols, col, alias)
-            if other and r < 0.35 and not self._is_known_date_index_string_eq(col, other[1]):
+            if other and r < 0.35 and not self._is_known_mysql_date_string_equality_risk(col, other[1]):
                 op = '=' if self._is_risky_cross_type_pair(col, other[1]) else '>='
                 return f"{ref} {op} {self._qref(other[0], other[1].name)}"
             return f"{ref} IS NOT NULL" if r < 0.65 else f"{ref} IS NULL"
@@ -923,7 +945,7 @@ class SubsetQueryGenerator:
                 return f"{ref} LIKE '{prefix}%'"
             if r < 0.46:
                 return f"{ref} >= {v}"
-            if r < 0.58 and other and not self._is_known_date_index_string_eq(col, other[1]):
+            if r < 0.58 and other and not self._is_known_mysql_date_string_equality_risk(col, other[1]):
                 return f"{ref} = {self._qref(other[0], other[1].name)}"
             if r < 0.70:
                 return f"{self._fn('LENGTH')}(COALESCE({ref}, {empty_str})) >= {random.randint(0, 8)}"
@@ -971,7 +993,11 @@ class SubsetQueryGenerator:
     def _join_on(self, a1: str, cols1: List[Any], a2: str, cols2: List[Any]) -> Optional[str]:
         c1 = self._pick_join_col(cols1)
         c2 = self._pick_compat_col(
-            cols2, c1, allow_known_date_index_string_eq=False)
+            cols2,
+            c1,
+            allow_known_date_index_string_eq=False,
+            allow_mysql_date_string_equality=False,
+        )
         if c1 is None or c2 is None:
             return None
 
@@ -992,7 +1018,8 @@ class SubsetQueryGenerator:
     def _pick_compat_col(self,
                          cols: List[Any],
                          ref: Optional[Any],
-                         allow_known_date_index_string_eq: bool = True) -> Optional[Any]:
+                         allow_known_date_index_string_eq: bool = True,
+                         allow_mysql_date_string_equality: bool = True) -> Optional[Any]:
         if ref is None:
             return None
         exact = [c for c in cols if c.data_type == ref.data_type]
@@ -1021,6 +1048,10 @@ class SubsetQueryGenerator:
                 allow_known_date_index_string_eq
                 or not self._is_known_date_index_string_eq(ref, c)
             )
+            and (
+                allow_mysql_date_string_equality
+                or not self._is_known_mysql_date_string_equality_risk(ref, c)
+            )
         ]
         if risky and random.random() < 0.75:
             return random.choice(risky)
@@ -1031,19 +1062,28 @@ class SubsetQueryGenerator:
                 allow_known_date_index_string_eq
                 or not self._is_known_date_index_string_eq(ref, c)
             )
+            and (
+                allow_mysql_date_string_equality
+                or not self._is_known_mysql_date_string_equality_risk(ref, c)
+            )
         ]
         return random.choice(compat) if compat else None
 
     def _pick_risky_join_pair(self,
                               cols1: List[Any],
                               cols2: List[Any],
-                              allow_known_date_index_string_eq: bool = True) -> Optional[Tuple[Any, Any]]:
+                              allow_known_date_index_string_eq: bool = True,
+                              allow_mysql_date_string_equality: bool = True) -> Optional[Tuple[Any, Any]]:
         pairs = [
             (c1, c2) for c1 in cols1 for c2 in cols2
             if self._is_risky_cross_type_pair(c1, c2)
             and (
                 allow_known_date_index_string_eq
                 or not self._is_known_date_index_string_eq(c1, c2)
+            )
+            and (
+                allow_mysql_date_string_equality
+                or not self._is_known_mysql_date_string_equality_risk(c1, c2)
             )
         ]
         return random.choice(pairs) if pairs else None
@@ -1085,6 +1125,8 @@ class SubsetQueryGenerator:
         dt = c1.data_type
 
         if self._is_known_date_index_string_eq(c1, c2):
+            return None
+        if self._is_known_mysql_date_string_equality_risk(c1, c2):
             return None
 
         if self._is_risky_cross_type_pair(c1, c2):
@@ -1131,7 +1173,8 @@ class SubsetQueryGenerator:
     def _same_comparable_type(self,
                               c1: Any,
                               c2: Any,
-                              allow_known_date_index_string_eq: bool = True) -> bool:
+                              allow_known_date_index_string_eq: bool = True,
+                              allow_mysql_date_string_equality: bool = True) -> bool:
         return (
             c1.data_type == c2.data_type
             or (c1.data_type in _INT_FAMILY and c2.data_type in _INT_FAMILY)
@@ -1142,6 +1185,10 @@ class SubsetQueryGenerator:
                 and (
                     allow_known_date_index_string_eq
                     or not self._is_known_date_index_string_eq(c1, c2)
+                )
+                and (
+                    allow_mysql_date_string_equality
+                    or not self._is_known_mysql_date_string_equality_risk(c1, c2)
                 )
             )
         )
@@ -1313,6 +1360,40 @@ class SubsetQueryGenerator:
         left_str = self._is_string_like_type(c1.data_type)
         right_str = self._is_string_like_type(c2.data_type)
         return (left_date and right_str) or (right_date and left_str)
+
+    def _is_known_mysql_date_string_equality_risk(self, c1: Any, c2: Any) -> bool:
+        if not self._enable_known_mysql_date_index_string_eq_workaround:
+            return False
+        left_date = c1.data_type == 'DATE'
+        right_date = c2.data_type == 'DATE'
+        left_str = self._is_string_like_type(c1.data_type)
+        right_str = self._is_string_like_type(c2.data_type)
+        return (left_date and right_str) or (right_date and left_str)
+
+    def _null_test_signature(self, pred: str) -> Optional[Tuple[str, bool]]:
+        m = re.fullmatch(
+            r"\s*(`[^`]+`\.`[^`]+`)\s+IS\s+(NOT\s+)?NULL\s*",
+            pred,
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+        return (m.group(1), bool(m.group(2)))
+
+    def _would_form_known_mysql_null_contradiction(self,
+                                                   preds: List[str],
+                                                   pred: str) -> bool:
+        if not self._enable_known_mysql_date_index_string_eq_workaround:
+            return False
+        sig = self._null_test_signature(pred)
+        if sig is None:
+            return False
+        ref, is_not_null = sig
+        for existing in preds:
+            existing_sig = self._null_test_signature(existing)
+            if existing_sig and existing_sig[0] == ref and existing_sig[1] != is_not_null:
+                return True
+        return False
 
     def _is_risky_cross_type_pair(self, c1: Any, c2: Any) -> bool:
         if c1.data_type == 'OPAQUE' or c2.data_type == 'OPAQUE':

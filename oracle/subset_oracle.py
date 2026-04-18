@@ -21,9 +21,11 @@ import hashlib
 import uuid
 import pymysql
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Set
 from datetime import datetime
+from pymysql.constants import FIELD_TYPE
 from oracle.subset_query_gen import SubsetQueryGenerator
 from data_structures.db_dialect import get_current_dialect, set_current_dialect
 
@@ -59,6 +61,18 @@ _RUNTIME_ERROR_PATTERNS: dict = {
 _TEMPORAL_TYPES    = ('DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR')
 _STRING_LIKE_TYPES = ('VARCHAR', 'TEXT', 'LONGTEXT', 'CHAR', 'ENUM', 'SET')
 _INDEXABLE_TYPES   = ('INT', 'VARCHAR', 'TEXT', 'LONGTEXT', 'CHAR', 'ENUM', 'SET') + _TEMPORAL_TYPES
+_MYSQL_NUMERIC_FIELD_TYPES = {
+    FIELD_TYPE.TINY,
+    FIELD_TYPE.SHORT,
+    FIELD_TYPE.LONG,
+    FIELD_TYPE.LONGLONG,
+    FIELD_TYPE.INT24,
+    FIELD_TYPE.DECIMAL,
+    FIELD_TYPE.NEWDECIMAL,
+    FIELD_TYPE.FLOAT,
+    FIELD_TYPE.DOUBLE,
+    FIELD_TYPE.YEAR,
+}
 
 
 # ─────────────────────────────────────────────
@@ -498,10 +512,20 @@ class SubsetOracle:
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT * FROM ({sql}) AS _sc LIMIT 0")
-                result_names = {desc[0] for desc in (cur.description or [])}
-            return [c for c in numeric_cols if c.name in result_names]
+                desc = list(cur.description or [])
+
+            if not desc:
+                return []
+
+            name_counts = Counter(d[0] for d in desc)
+            numeric_result_names = {
+                d[0] for d in desc
+                if name_counts[d[0]] == 1 and d[1] in _MYSQL_NUMERIC_FIELD_TYPES
+            }
+            return [c for c in numeric_cols if c.name in numeric_result_names]
         except Exception:
             return []
+
 
     # ──────────────────────────────────────────
     # Step 1.5：谓词列 / 索引 / 偏斜配置
@@ -858,12 +882,18 @@ class SubsetOracle:
           3. MIN  单调：MIN(col, S1) ≥ MIN(col, S2)，对所有 numeric 列
           4. 行集合子集：row_digests(S1) ⊆ row_digests(S2)
         """
-        self._verify_count(spec, s1, s2)
-        for c in numeric_cols:
-            self._verify_max(spec, c.name, s1, s2)
-            self._verify_min(spec, c.name, s1, s2)
-        if s1.row_digests:
-            self._verify_row_subset(conn, spec, s1, s2)
+        try:
+            self._verify_count(spec, s1, s2)
+            for c in numeric_cols:
+                self._verify_max(spec, c.name, s1, s2)
+                self._verify_min(spec, c.name, s1, s2)
+            if s1.row_digests:
+                self._verify_row_subset(conn, spec, s1, s2)
+        except AssertionError as e:
+            if self._is_known_mysql_null_contradiction_query(spec.select_sql):
+                self._log(f"  Known MySQL NULL-contradiction bug suppressed: {e}")
+                return
+            raise
 
     def _verify_count(self, spec, s1, s2):
         if s1.count is None or s2.count is None: return
@@ -1002,6 +1032,19 @@ class SubsetOracle:
         row = re.sub(r'filtered=[^;]+', 'filtered=?', row)
         row = re.sub(r'key_len=[^;]+',  'key_len=?',  row)
         return row.strip()
+
+    def _is_known_mysql_null_contradiction_query(self, select_sql: str) -> bool:
+        dialect = getattr(self, '_dialect', get_current_dialect())
+        if dialect.optimizer_family() != 'mysql':
+            return False
+
+        normalized = re.sub(r'\s+', ' ', select_sql.upper()).strip()
+        if ' OR ' in normalized:
+            return False
+
+        is_null_refs = set(re.findall(r"(`[^`]+`\.`[^`]+`)\s+IS\s+NULL\b", normalized))
+        is_not_null_refs = set(re.findall(r"(`[^`]+`\.`[^`]+`)\s+IS\s+NOT\s+NULL\b", normalized))
+        return bool(is_null_refs & is_not_null_refs)
 
     # ──────────────────────────────────────────
     # 行摘要
