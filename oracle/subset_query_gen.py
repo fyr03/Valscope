@@ -403,6 +403,7 @@ class SubsetQueryGenerator:
                 allow_known_date_index_string_eq=False,
                 allow_mysql_date_string_equality=False,
             )
+            and not self._is_known_mysql_year_string_in_subquery_risk(main_col, c)
         ]
         if not compat:
             return self._build_single()
@@ -446,6 +447,8 @@ class SubsetQueryGenerator:
         alias_cols = [(alias, cols)]
         where = self._merge_where(self._where_clause(alias_cols), exists_pred)
         sql = f"SELECT {self._select_list(alias_cols)} FROM {self._qi(tname)} {alias}{where}"
+        if self._is_known_mysql_exists_order_by_year_string_risk(jc_main, jc_sub):
+            return sql
         return self._maybe_add_order_by(sql, alias_cols)
 
     def _build_nested_derived(self) -> str:
@@ -1369,6 +1372,21 @@ class SubsetQueryGenerator:
         left_str = self._is_string_like_type(c1.data_type)
         right_str = self._is_string_like_type(c2.data_type)
         return (left_date and right_str) or (right_date and left_str)
+
+    def _is_known_mysql_year_string_in_subquery_risk(self, c1: Any, c2: Any) -> bool:
+        if not self._enable_known_mysql_date_index_string_eq_workaround:
+            return False
+        left_year = c1.data_type == 'YEAR'
+        right_year = c2.data_type == 'YEAR'
+        left_str = self._is_string_like_type(c1.data_type)
+        right_str = self._is_string_like_type(c2.data_type)
+        return (left_year and right_str) or (right_year and left_str)
+
+    def _is_known_mysql_exists_order_by_year_string_risk(self, c1: Any, c2: Any) -> bool:
+        return (
+            self._dialect.optimizer_family() == 'mysql'
+            and self._is_known_mysql_year_string_in_subquery_risk(c1, c2)
+        )
 
     def _null_test_signature(self, pred: str) -> Optional[Tuple[str, bool]]:
         m = re.fullmatch(

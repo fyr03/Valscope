@@ -21,6 +21,7 @@ import hashlib
 import uuid
 import pymysql
 import time
+from decimal import Decimal
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Set
@@ -73,7 +74,6 @@ _MYSQL_NUMERIC_FIELD_TYPES = {
     FIELD_TYPE.DOUBLE,
     FIELD_TYPE.YEAR,
 }
-
 
 # ─────────────────────────────────────────────
 # 数据类
@@ -893,6 +893,17 @@ class SubsetOracle:
             if self._is_known_mysql_null_contradiction_query(spec.select_sql):
                 self._log(f"  Known MySQL NULL-contradiction bug suppressed: {e}")
                 return
+            if self._is_known_mysql_year_string_in_subquery_bug(conn, spec.select_sql):
+                self._log(f"  Known MySQL YEAR-string IN-subquery bug suppressed: {e}")
+                return
+            if self._is_known_mysql_exists_year_materialization_bug(
+                conn,
+                spec.select_sql,
+                s1.explain_plan,
+                s2.explain_plan,
+            ):
+                self._log(f"  Known MySQL YEAR-string EXISTS-materialization bug suppressed: {e}")
+                return
             raise
 
     def _verify_count(self, spec, s1, s2):
@@ -1046,6 +1057,164 @@ class SubsetOracle:
         is_not_null_refs = set(re.findall(r"(`[^`]+`\.`[^`]+`)\s+IS\s+NOT\s+NULL\b", normalized))
         return bool(is_null_refs & is_not_null_refs)
 
+    def _is_known_mysql_year_string_in_subquery_bug(self, conn, select_sql: str) -> bool:
+        dialect = getattr(self, '_dialect', get_current_dialect())
+        if dialect.optimizer_family() != 'mysql':
+            return False
+
+        normalized = re.sub(r'\s+', ' ', select_sql.strip())
+        upper = normalized.upper()
+        if '/*IMPLICIT_CONVERSION_IN*/' not in upper:
+            return False
+        if ' IN (' not in upper or 'SELECT ' not in upper:
+            return False
+
+        parsed = self._extract_in_subquery_type_probe_refs(normalized)
+        if parsed is None:
+            return False
+
+        outer_table, outer_col, inner_table, inner_col = parsed
+        outer_type = self._lookup_column_type(conn, outer_table, outer_col)
+        inner_type = self._lookup_column_type(conn, inner_table, inner_col)
+        if outer_type is None or inner_type is None:
+            return False
+
+        return (
+            (self._is_string_like_sql_type(outer_type) and inner_type == 'YEAR')
+            or (outer_type == 'YEAR' and self._is_string_like_sql_type(inner_type))
+        )
+
+    def _is_known_mysql_exists_year_materialization_bug(
+        self,
+        conn,
+        select_sql: str,
+        s1_plan: List[str],
+        s2_plan: List[str],
+    ) -> bool:
+        dialect = getattr(self, '_dialect', get_current_dialect())
+        if dialect.optimizer_family() != 'mysql':
+            return False
+
+        normalized = re.sub(r'\s+', ' ', select_sql.strip())
+        upper = normalized.upper()
+        if ' EXISTS (' not in upper or 'SELECT 1' not in upper:
+            return False
+        if ' ORDER BY ' in upper:
+            return False
+        if 'CAST(' in upper:
+            return False
+        if not self._plan_has_firstmatch(s1_plan):
+            return False
+        if not self._plan_has_materialized_exists_lookup(s2_plan):
+            return False
+
+        parsed = self._extract_exists_type_probe_refs(normalized)
+        if parsed is None:
+            return False
+
+        outer_table, outer_col, inner_table, inner_col = parsed
+        outer_type = self._lookup_column_type(conn, outer_table, outer_col)
+        inner_type = self._lookup_column_type(conn, inner_table, inner_col)
+        if outer_type is None or inner_type is None:
+            return False
+
+        return (
+            (self._is_string_like_sql_type(outer_type) and inner_type == 'YEAR')
+            or (outer_type == 'YEAR' and self._is_string_like_sql_type(inner_type))
+        )
+
+    def _extract_in_subquery_type_probe_refs(self, select_sql: str):
+        outer_match = re.search(
+            r"(`[^`]+`\.`[^`]+`)\s+IN\s*\(\s*SELECT\s+(`[^`]+`\.`[^`]+`)\s+FROM\s+`([^`]+)`",
+            select_sql,
+            re.IGNORECASE,
+        )
+        if not outer_match:
+            return None
+
+        outer_ref = outer_match.group(1)
+        inner_ref = outer_match.group(2)
+        inner_table = outer_match.group(3)
+        outer_parts = re.findall(r'`([^`]+)`', outer_ref)
+        inner_parts = re.findall(r'`([^`]+)`', inner_ref)
+        if len(outer_parts) != 2 or len(inner_parts) != 2:
+            return None
+
+        outer_col = outer_parts[1]
+        inner_col = inner_parts[1]
+
+        table_matches = re.findall(r'FROM\s+`([^`]+)`', select_sql, re.IGNORECASE)
+        if not table_matches:
+            return None
+        outer_table = table_matches[0]
+        return (outer_table, outer_col, inner_table, inner_col)
+
+    def _extract_exists_type_probe_refs(self, select_sql: str):
+        outer_match = re.search(
+            r"FROM\s+`([^`]+)`\s+([A-Za-z_][A-Za-z0-9_]*)",
+            select_sql,
+            re.IGNORECASE,
+        )
+        inner_match = re.search(
+            r"EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+`([^`]+)`\s+([A-Za-z_][A-Za-z0-9_]*)",
+            select_sql,
+            re.IGNORECASE,
+        )
+        if not outer_match or not inner_match:
+            return None
+
+        outer_table, outer_alias = outer_match.group(1), outer_match.group(2)
+        inner_table, inner_alias = inner_match.group(1), inner_match.group(2)
+
+        pair_patterns = [
+            rf"`{re.escape(outer_alias)}`\.`([^`]+)`\s*=\s*`{re.escape(inner_alias)}`\.`([^`]+)`",
+            rf"`{re.escape(inner_alias)}`\.`([^`]+)`\s*=\s*`{re.escape(outer_alias)}`\.`([^`]+)`",
+        ]
+        for i, pattern in enumerate(pair_patterns):
+            match = re.search(pattern, select_sql, re.IGNORECASE)
+            if not match:
+                continue
+            if i == 0:
+                outer_col, inner_col = match.group(1), match.group(2)
+            else:
+                inner_col, outer_col = match.group(1), match.group(2)
+            return (outer_table, outer_col, inner_table, inner_col)
+        return None
+
+    def _plan_has_firstmatch(self, plan: List[str]) -> bool:
+        return any('FirstMatch(' in row for row in plan)
+
+    def _plan_has_materialized_exists_lookup(self, plan: List[str]) -> bool:
+        has_materialized = any('select_type=MATERIALIZED' in row for row in plan)
+        has_subquery_lookup = any('table=<subquery2>' in row for row in plan)
+        return has_materialized and has_subquery_lookup
+
+    def _lookup_column_type(self, conn, table_name: str, col_name: str) -> Optional[str]:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DATABASE()")
+                row = cur.fetchone()
+                current_db = row[0] if row else None
+                if not current_db:
+                    return None
+                cur.execute(
+                    """
+                    SELECT UPPER(DATA_TYPE)
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = %s
+                      AND column_name = %s
+                    """,
+                    (current_db, table_name, col_name),
+                )
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
+    def _is_string_like_sql_type(self, data_type: str) -> bool:
+        return data_type in _STRING_LIKE_TYPES
+
     # ──────────────────────────────────────────
     # 行摘要
     # ──────────────────────────────────────────
@@ -1066,15 +1235,31 @@ class SubsetOracle:
     def _row_digest(self, row: tuple) -> str:
         h = hashlib.sha256()
         for i, val in enumerate(row):
-            if i > 0: h.update(b'|')
-            s = 'NULL' if val is None else str(val).rstrip()
-            try:
-                f = float(s)
-                if f == 0.0: s = '0.0'
-            except (ValueError, TypeError):
-                pass
+            if i > 0:
+                h.update(b'|')
+            s = self._canonicalize_digest_value(val)
             h.update(s.encode('utf-8'))
         return h.hexdigest()
+
+    def _canonicalize_digest_value(self, val) -> str:
+        if val is None:
+            return 'NULL'
+        if isinstance(val, bool):
+            return '1' if val else '0'
+        if isinstance(val, int):
+            return str(val)
+        if isinstance(val, Decimal):
+            if not val.is_finite():
+                return str(val)
+            normalized = val.normalize()
+            if normalized == 0:
+                return '0'
+            return format(normalized, 'f')
+        if isinstance(val, float):
+            if val == 0.0:
+                return '0'
+            return format(Decimal(str(val)).normalize(), 'f')
+        return str(val).rstrip()
 
     # ──────────────────────────────────────────
     # Bug 日志
