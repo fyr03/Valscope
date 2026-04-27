@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Set, Tuple
 from datetime import datetime
 
-from oracle.subset_query_gen import SubsetQueryGenerator
+from oracle.vertical_query_gen import VerticalQueryGenerator
 from data_structures.db_dialect import get_current_dialect, set_current_dialect
 
 
@@ -52,6 +52,7 @@ MIN_BASELINE_QUERIES    = 3
 MAX_QUERY_GEN_ATTEMPTS  = 120
 BASELINE_ROWS           = 20
 NOISE_ROWS              = 8
+HOT_SEED_ROWS           = 4
 FLOAT_TOLERANCE         = 1e-9
 MONO_COUNT              = 'count'
 MONO_MAX                = 'max'
@@ -136,6 +137,12 @@ class VertSnapshot:
     count_distinct: Dict[str, Optional[int]]   = field(default_factory=dict)  # COUNT(DISTINCT col)
     row_digests:    Dict[str, int]             = field(default_factory=dict)
     explain_plan:   List[str]                  = field(default_factory=list)
+
+
+@dataclass
+class VertSkewProfile:
+    hot_values_by_col:    Dict[str, List[str]] = field(default_factory=dict)
+    medium_values_by_col: Dict[str, List[str]] = field(default_factory=dict)
 
 
 class IgnorableQueryRuntimeError(Exception):
@@ -248,7 +255,8 @@ class VerticalOracle:
                     return round_stats
                 self._log(f"  Phi cols (E mutation): {[c.name for c in phi_cols]}")
 
-            self._insert_s1_data(conn, s1_name, main_cols, phi_cols)
+            skew = self._create_skew_profile(main_cols)
+            self._insert_s1_data(conn, s1_name, main_cols, phi_cols, skew)
             self._insert_aux_data(conn, vs_tables, aux_names)
 
             s1_count = self._exec_single_int(conn, f"SELECT COUNT(*) FROM {s1_name}")
@@ -267,9 +275,12 @@ class VerticalOracle:
             self._populate_s2(conn, s1_name, s2_name, main_cols, phi_cols, mutations)
 
             # ── Step 3c：C 变体 — 新增索引 ────────────────
+            indexed_col_names: Set[str] = set()
             if MUT_ADD_INDEX in mutations:
-                self._add_s2_indexes(conn, s2_name, main_cols, uid)
-                self._log(f"  C: secondary indexes added to S2")
+                indexed_col_names = self._add_s2_indexes(conn, s2_name, main_cols, uid)
+                for c in main_cols:
+                    c.is_indexed = c.name in indexed_col_names
+                self._log(f"  C: secondary indexes added to S2 on {sorted(indexed_col_names)}")
 
             s2_count = self._exec_single_int(conn, f"SELECT COUNT(*) FROM {s2_name}")
             self._log(f"  S2 rows: {s2_count}")
@@ -286,11 +297,11 @@ class VerticalOracle:
                 for tbl in vs_tables[1:]
             ]
             # TODO (Medium): 等价类 (ABCD) 应使用 valscope 原生生成器以覆盖
-            # GROUP BY / LEFT JOIN / HAVING 等 SubsetQueryGenerator 禁止的 pattern。
-            # 目前统一使用 SubsetQueryGenerator，等价验证正确性不受影响，只是覆盖面偏窄。
-            gen = SubsetQueryGenerator(
+            # GROUP BY / LEFT JOIN / HAVING 等 pattern 仍然被当前 vertical generator 禁止。
+            # 目前统一使用 VerticalQueryGenerator，等价验证正确性不受影响，只是覆盖面仍偏窄。
+            gen = VerticalQueryGenerator(
                 tables=shared_tables,
-                skew_hot_values=None,
+                skew_hot_values={s1_name: skew.hot_values_by_col},
                 dialect=self._dialect,
                 enable_known_mysql_date_index_string_eq_workaround=self._workaround_date,
             )
@@ -537,20 +548,31 @@ class VerticalOracle:
     # Step 2b：S1 数据插入
     # ──────────────────────────────────────────
     def _insert_s1_data(self, conn, s1_name: str, main_cols: List[ColDef],
-                        phi_cols: List[ColDef]):
-        """填充 S1：对 Φ 列（E 变体）约 50% 概率插入 NULL，保证 S1 中有足够 NULL。"""
+                        phi_cols: List[ColDef], skew: VertSkewProfile):
+        """填充 S1：使用偏斜分布 + 边界噪声，让优化器更容易感知热点值。"""
         phi_names = {c.name for c in phi_cols}
+
+        for _ in range(HOT_SEED_ROWS):
+            vals = []
+            for c in main_cols:
+                if c.is_primary_key:
+                    vals.append(str(random.randint(1, 10_000_000)))
+                elif c.name in phi_names and random.random() < 0.50:
+                    vals.append('NULL')
+                else:
+                    hot_vals = skew.hot_values_by_col.get(c.name, [])
+                    vals.append(random.choice(hot_vals) if hot_vals else self._random_val(c))
+            self._try_insert(conn, s1_name, main_cols, vals)
 
         for _ in range(BASELINE_ROWS):
             vals = []
             for c in main_cols:
                 if c.is_primary_key:
                     vals.append(str(random.randint(1, 10_000_000)))
-                elif c.name in phi_names:
-                    # E 变体：Φ 列 50% 插 NULL
-                    vals.append('NULL' if random.random() < 0.50 else self._random_val(c))
+                elif c.name in phi_names and random.random() < 0.50:
+                    vals.append('NULL')
                 else:
-                    vals.append(self._random_val(c))
+                    vals.append(self._skewed_random_val(c, skew))
             self._try_insert(conn, s1_name, main_cols, vals)
 
         # noise rows：边界值 + 更高 NULL 比例
@@ -565,18 +587,84 @@ class VerticalOracle:
                     vals.append(self._noise_val(c))
             self._try_insert(conn, s1_name, main_cols, vals)
 
+    def _create_skew_profile(self, cols: List[ColDef]) -> VertSkewProfile:
+        return VertSkewProfile(
+            hot_values_by_col={c.name: self._create_hot_values(c) for c in cols},
+            medium_values_by_col={c.name: self._create_medium_values(c) for c in cols},
+        )
+
+    def _create_hot_values(self, col: ColDef) -> List[str]:
+        dt = col.data_type
+        if dt == 'INT':
+            base = random.randint(-16, 16)
+            return [str(base), str(base + 1 + random.randint(0, 2))]
+        if dt == 'VARCHAR':
+            token = f"hv_{random.randint(100, 9999)}"
+            return [f"'{token}'", f"'{token}_x'"]
+        if dt in ('FLOAT', 'DOUBLE'):
+            base = random.randint(-200, 200) / 10.0
+            return [f"{base:.3f}", f"{base + 1.0:.3f}"]
+        if dt == 'DECIMAL':
+            base = random.randint(-1000, 1000) / 100.0
+            return [f"{base:.2f}", f"{base + 1.0:.2f}"]
+        if dt == 'DATE':
+            return ["'1970-01-01'", "'2023-01-01'"]
+        return ['NULL']
+
+    def _create_medium_values(self, col: ColDef) -> List[str]:
+        dt = col.data_type
+        if dt == 'INT':
+            base = random.randint(-64, 64)
+            return [str(base), str(base + 7), str(base - 7)]
+        if dt == 'VARCHAR':
+            token = f"mv_{random.randint(100, 9999)}"
+            return [f"'{token}'", f"'{token}_tail'", "'2023-01-01'"]
+        if dt in ('FLOAT', 'DOUBLE'):
+            base = random.randint(-500, 500) / 10.0
+            return [f"{base:.3f}", f"{base + 5.0:.3f}", f"{base - 5.0:.3f}"]
+        if dt == 'DECIMAL':
+            base = random.randint(-5000, 5000) / 100.0
+            return [f"{base:.2f}", f"{base + 5.0:.2f}", f"{base - 5.0:.2f}"]
+        if dt == 'DATE':
+            return ["'2000-01-01'", "'2010-06-15'", "'2024-02-29'"]
+        return ['NULL']
+
+    def _skewed_random_val(self, col: ColDef, skew: VertSkewProfile) -> str:
+        if col.is_primary_key:
+            return str(random.randint(1, 10_000_000))
+
+        roll = random.random()
+        if roll < 0.48:
+            hot_vals = skew.hot_values_by_col.get(col.name, [])
+            if hot_vals:
+                return random.choice(hot_vals)
+        if roll < 0.82:
+            medium_vals = skew.medium_values_by_col.get(col.name, [])
+            if medium_vals:
+                return random.choice(medium_vals)
+        return self._random_val(col)
+
     def _random_val(self, col: ColDef) -> str:
         dt = col.data_type
         if dt == 'INT':
+            if random.random() < 0.15:
+                return random.choice(['2147483647', '-2147483648', '0', '1', '-1'])
             return str(random.randint(-1000, 1000))
         if dt == 'VARCHAR':
             n = random.randint(1, min(12, col.varchar_len))
             return f"'{''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=n))}'"
         if dt in ('FLOAT', 'DOUBLE'):
+            if random.random() < 0.12:
+                boundary = '3.4028235E38' if dt == 'FLOAT' else '1.7976931348623157E308'
+                return random.choice([boundary, f"-{boundary}", '0.0', '1.0', '-1.0'])
             return f"{random.uniform(-1000, 1000):.3f}"
         if dt == 'DECIMAL':
+            if random.random() < 0.12:
+                return random.choice(['99999999.99', '-99999999.99', '0.00', '1.00', '-1.00'])
             return f"{random.uniform(-1000, 1000):.2f}"
         if dt == 'DATE':
+            if random.random() < 0.15:
+                return random.choice(["'1000-01-01'", "'1970-01-01'", "'2024-02-29'", "'9999-12-31'"])
             return (f"'{random.randint(2000, 2023)}-"
                     f"{random.randint(1, 12):02d}-{random.randint(1, 28):02d}'")
         return 'NULL'
@@ -586,11 +674,11 @@ class VerticalOracle:
         dt = col.data_type
         boundary = {
             'INT':     ['0', '1', '-1', '2147483647', '-2147483648', 'NULL'],
-            'VARCHAR': ["''", "'NULL'", "'0'", "'%'", 'NULL'],
-            'FLOAT':   ['0', '0.0', '1.0', '-1.0', 'NULL'],
-            'DOUBLE':  ['0', '0.0', '1.0', '-1.0', 'NULL'],
-            'DECIMAL': ['0.00', '1.00', '-1.00', 'NULL'],
-            'DATE':    ["'2023-01-01'", "'1970-01-01'", "'9999-12-31'", 'NULL'],
+            'VARCHAR': ["''", "'NULL'", "'0'", "'1'", "'%'", "'_'", "'2023-01-01'", 'NULL'],
+            'FLOAT':   ['0', '0.0', '-0.0', '1.0', '-1.0', '3.4028235E38', '-3.4028235E38', 'NULL'],
+            'DOUBLE':  ['0', '0.0', '-0.0', '1.0', '-1.0', '1.7976931348623157E308', '-1.7976931348623157E308', 'NULL'],
+            'DECIMAL': ['0.00', '1.00', '-1.00', '99999999.99', '-99999999.99', 'NULL'],
+            'DATE':    ["'1000-01-01'", "'1970-01-01'", "'2024-02-29'", "'9999-12-31'", 'NULL'],
         }
         candidates = list(boundary.get(dt, ['NULL']))
         if not col.is_nullable:
@@ -647,16 +735,23 @@ class VerticalOracle:
     def _concrete_fill_value(self, col: ColDef) -> str:
         """为 E 变体生成填充 NULL 的具体值（取值要在 S1 已有值域之外以避免 trivial 通过）。"""
         dt = col.data_type
-        if dt == 'INT':    return str(random.randint(1000, 9999))
+        if dt == 'INT':
+            if random.random() < 0.5:
+                return random.choice(['2147483647', '2147483646', '999999999'])
+            return random.choice(['-2147483648', '-2147483647', '-999999999'])
         if dt == 'VARCHAR': return f"'fill_{random.randint(100, 999)}'"
-        if dt in ('FLOAT', 'DOUBLE'): return f"{random.uniform(100, 999):.3f}"
-        if dt == 'DECIMAL': return f"{random.uniform(100, 999):.2f}"
+        if dt == 'FLOAT':
+            return random.choice(['3.4028235E38', '-3.4028235E38', '99999.000', '-99999.000'])
+        if dt == 'DOUBLE':
+            return random.choice(['1.7976931348623157E308', '-1.7976931348623157E308', '999999.000', '-999999.000'])
+        if dt == 'DECIMAL':
+            return random.choice(['99999999.99', '-99999999.99', '9999.99', '-9999.99'])
         return '1'
 
     # ──────────────────────────────────────────
     # Step 3c：C 变体 — 新增索引
     # ──────────────────────────────────────────
-    def _add_s2_indexes(self, conn, s2_name: str, main_cols: List[ColDef], uid: str):
+    def _add_s2_indexes(self, conn, s2_name: str, main_cols: List[ColDef], uid: str) -> Set[str]:
         """为 S2 新增单列索引（必选）和复合索引（可选），触发 plan change。"""
         candidates = [
             c for c in main_cols
@@ -664,10 +759,23 @@ class VerticalOracle:
             and c.data_type in ('INT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'VARCHAR', 'DATE')
         ]
         if not candidates:
-            return
+            return set()
 
         # 单列索引（必选）
-        col = random.choice(candidates)
+        def score(col: ColDef) -> int:
+            base = 0
+            if col.data_type in ('INT', 'VARCHAR', 'DATE'):
+                base += 5
+            elif col.data_type in ('DECIMAL', 'FLOAT', 'DOUBLE'):
+                base += 3
+            if not col.is_nullable:
+                base += 1
+            return base
+
+        candidates = sorted(candidates, key=score, reverse=True)
+        top_k = candidates[:max(2, min(4, len(candidates)))]
+        col = random.choice(top_k)
+        chosen = {col.name}
         idx_expr = (f"`{col.name}`(32)" if col.data_type == 'VARCHAR'
                     else f"`{col.name}`")
         self._exec_ddl(conn,
@@ -675,13 +783,16 @@ class VerticalOracle:
             ignore_error=True)
 
         # 复合索引（选两列，50% 概率）
-        if len(candidates) >= 2 and random.random() < 0.50:
-            c1, c2 = random.sample(candidates, 2)
+        secondary_pool = [c for c in top_k if c.name != col.name]
+        if secondary_pool and random.random() < 0.50:
+            c1, c2 = col, random.choice(secondary_pool)
+            chosen.add(c2.name)
             e1 = f"`{c1.name}`(32)" if c1.data_type == 'VARCHAR' else f"`{c1.name}`"
             e2 = f"`{c2.name}`(32)" if c2.data_type == 'VARCHAR' else f"`{c2.name}`"
             self._exec_ddl(conn,
                 f"CREATE INDEX i_vert_{uid}_c ON {s2_name} ({e1}, {e2})",
                 ignore_error=True)
+        return chosen
 
     # ──────────────────────────────────────────
     # E 变体辅助
